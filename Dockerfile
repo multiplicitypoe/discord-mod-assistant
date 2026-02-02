@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1
-
-FROM python:3.10-slim-bookworm
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
@@ -19,19 +18,31 @@ RUN set -eux; \
         apt-get install -y --no-install-recommends \
             ca-certificates \
             tzdata \
+            libbrotli1 \
+            libbz2-1.0 \
             libatomic1 \
+            libc6 \
+            libdeflate0 \
             libfreetype6 \
             libgcc-s1 \
+            libjbig0 \
             libjpeg62-turbo \
             liblcms2-2 \
+            liblerc4 \
+            liblzma5 \
             libopenjp2-7 \
             libstdc++6 \
             libtiff6 \
+            libsharpyuv0 \
             libwebp7 \
             libwebpdemux2 \
             libwebpmux3 \
             libxcb1 \
+            libxau6 \
+            libxdmcp6 \
+            libzstd1 \
             zlib1g; \
+        (apt-get install -y --no-install-recommends libpng16-16 || apt-get install -y --no-install-recommends libpng16-16t64); \
     else \
         apt-get install -y --no-install-recommends \
             ca-certificates \
