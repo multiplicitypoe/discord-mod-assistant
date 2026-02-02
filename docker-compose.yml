@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./data:/app/data
+    init: true

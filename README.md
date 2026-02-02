@@ -31,6 +31,35 @@ cp .env.example .env
 make run-bot
 ```
 
+## Running with Docker (WSL + Raspberry Pi OS 64-bit)
+
+1) Create `.env` (see `.env.example`):
+
+```bash
+cp .env.example .env
+```
+
+2) Build and run:
+
+```bash
+docker build -t discord-incident-assistant .
+docker run --rm --env-file .env \
+  -v "$(pwd)/data:/app/data" \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --pids-limit 256 \
+  --memory 512m \
+  --cpus 1.0 \
+  --user "$(id -u):$(id -g)" \
+  discord-incident-assistant
+```
+
+Stop with Ctrl+C.
+
+If you prefer Compose, `docker-compose up --build` also works (uses `docker-compose.yml`; override UID/GID if needed).
+
 ## Slash commands
 
 - `/mod limit:50`

@@ -1,12 +1,13 @@
 .env
 .venv/
-data/*
-!data/.gitkeep
 __pycache__/
 *.pyc
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.git/
+.github/
+data/
+*.sqlite3
 dist/
 build/
-*.sqlite3
