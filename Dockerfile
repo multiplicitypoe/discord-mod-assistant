@@ -33,7 +33,6 @@ RUN set -eux; \
             libopenjp2-7 \
             libstdc++6 \
             libtiff6 \
-            libsharpyuv0 \
             libwebp7 \
             libwebpdemux2 \
             libwebpmux3 \
