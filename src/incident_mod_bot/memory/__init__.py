@@ -1,0 +1,1 @@
+"""Memory storage for incidents."""

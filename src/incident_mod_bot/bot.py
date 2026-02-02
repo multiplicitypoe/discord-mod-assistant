@@ -1,0 +1,1971 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import time
+from typing import Any
+
+import discord
+import httpx
+from discord import app_commands
+from dotenv import load_dotenv
+from openai import AuthenticationError
+
+from incident_mod_bot.config import Settings, load_settings
+from incident_mod_bot.discord_ui.incident_view import IncidentView, IncidentViewPayload
+from incident_mod_bot.discord_ui.view_store import ViewRecord, ViewStore
+from incident_mod_bot.memory.store import MemoryStore
+from incident_mod_bot.openai_client import (
+    OpenAISettings,
+    analyze_incident,
+    create_client,
+    refine_incident_with_images,
+    summarize_images,
+    summarize_rules,
+)
+from incident_mod_bot.pipeline.incident import IncidentResult, ReplyTarget, parse_incident_result
+from incident_mod_bot.utils.discord import display_name, is_mod
+from incident_mod_bot.utils.images import resize_image_bytes, to_data_url
+from incident_mod_bot.utils.text import compress_text, human_timedelta, truncate
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("incident_mod_bot")
+
+DEFAULT_AUTO_IGNORE_CATEGORY_NAMES = {"Moderation", "Logs", "Modmail", "Information"}
+
+
+class IncidentBot(discord.Client):
+    def __init__(self, settings: Settings) -> None:
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True
+        super().__init__(intents=intents)
+        self.settings = settings
+        self.tree = app_commands.CommandTree(self)
+        self.memory_store = MemoryStore(settings.db_path)
+        self.view_store = ViewStore(settings.db_path)
+        self.openai = create_client(settings.openai_api_key)
+        self._auto_last_run: dict[tuple[int, int], float] = {}
+
+    def _ctx(self, interaction: discord.Interaction) -> str:
+        guild = interaction.guild
+        if guild:
+            guild_part = f"{guild.id}({guild.name!r})"
+        else:
+            guild_part = "(no_guild)"
+
+        channel = interaction.channel
+        channel_id = getattr(channel, "id", None)
+        channel_name = getattr(channel, "name", None)
+        if channel_id is None:
+            channel_part = "(no_channel)"
+        elif channel_name:
+            channel_part = f"{channel_id}({channel_name!r})"
+        else:
+            channel_part = str(channel_id)
+
+        user = interaction.user
+        user_id = getattr(user, "id", None)
+        user_name = None
+        if isinstance(user, discord.Member):
+            user_name = user.display_name
+        else:
+            user_name = getattr(user, "name", None) or str(user)
+        if user_id is None:
+            user_part = "(no_user)"
+        else:
+            user_part = f"{user_id}({user_name!r})"
+
+        return f"guild={guild_part} channel={channel_part} user={user_part}"
+
+    def _log_cmd(self, interaction: discord.Interaction, name: str, **fields: object) -> None:
+        parts: list[str] = []
+        for key, value in fields.items():
+            if value is None:
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            parts.append(f"{key}={text}")
+        detail = " ".join(parts)
+        if detail:
+            logger.info("CMD /%s %s %s", name, self._ctx(interaction), detail)
+        else:
+            logger.info("CMD /%s %s", name, self._ctx(interaction))
+
+    def _dlog(self, interaction: discord.Interaction, message: str, *args: object) -> None:
+        if not self.settings.debug_logs:
+            return
+        logger.info("DEBUG %s " + message, self._ctx(interaction), *args)
+
+    def _dlog_ctx(self, ctx: str, message: str, *args: object) -> None:
+        if not self.settings.debug_logs:
+            return
+        logger.info("DEBUG %s " + message, ctx, *args)
+
+    @staticmethod
+    def _ascii_only(text: str) -> str:
+        if not text:
+            return ""
+        return text.encode("ascii", "ignore").decode("ascii")
+
+    @classmethod
+    def _sanitize_draft_text(cls, text: str) -> str:
+        s = cls._ascii_only(text)
+        # Strip Discord emoji markup that renders as emojis.
+        # - Custom emoji: <:name:123> / <a:name:123>
+        # - Unicode emoji aliases: :smile:
+        s = re.sub(r"<a?:[^:>]{2,}:[0-9]+>", "", s)
+        s = re.sub(r":[a-z0-9_+\-]{2,}:", "", s, flags=re.IGNORECASE)
+        # Avoid accidental mentions; the UI adds pings.
+        s = s.replace("@", "")
+        s = "\n".join(" ".join(line.split()) for line in s.splitlines())
+        return s.strip()
+
+    def _postprocess_result(self, result: IncidentResult, messages: list[discord.Message]) -> None:
+        # Sanitize model text.
+        result.draft_message = self._sanitize_draft_text(result.draft_message)
+        for line in result.draft_replies:
+            line.text = self._sanitize_draft_text(line.text)
+
+        # If the model wrote per-user drafts but forgot targets, infer targets from those.
+        if not result.reply_targets and result.draft_replies:
+            seen: set[int] = set()
+            for line in result.draft_replies:
+                if line.user_id in seen:
+                    continue
+                seen.add(line.user_id)
+                result.reply_targets.append(ReplyTarget(user_id=line.user_id, message_id=None))
+
+        # If the model wrote a draft but forgot reply_targets, infer from evidence quote authors.
+        if not result.reply_targets and result.draft_message:
+            by_id: dict[int, discord.Message] = {m.id: m for m in messages}
+            user_ids: list[int] = []
+            seen_uids: set[int] = set()
+            for q in result.evidence_quotes:
+                if q.message_id is None:
+                    continue
+                msg = by_id.get(q.message_id)
+                if msg is None:
+                    continue
+                uid = msg.author.id
+                if uid in seen_uids:
+                    continue
+                seen_uids.add(uid)
+                user_ids.append(uid)
+                if len(user_ids) >= 3:
+                    break
+            if user_ids:
+                if len(user_ids) == 1:
+                    uid = user_ids[0]
+                    message_id = None
+                    # Prefer replying to the first evidence quote from that user.
+                    for q in result.evidence_quotes:
+                        if q.message_id is None:
+                            continue
+                        msg = by_id.get(q.message_id)
+                        if msg and msg.author.id == uid:
+                            message_id = msg.id
+                            break
+                    result.reply_targets = [ReplyTarget(user_id=uid, message_id=message_id)]
+                else:
+                    result.reply_targets = [ReplyTarget(user_id=uid, message_id=None) for uid in user_ids]
+
+        # Ensure single-target replies have a message_id.
+        if len(result.reply_targets) == 1 and result.reply_targets[0].message_id is None:
+            uid = result.reply_targets[0].user_id
+            for msg in reversed(messages):
+                if msg.author.id == uid:
+                    result.reply_targets[0].message_id = msg.id
+                    break
+
+        # Avoid doubling the target name when we already prefix with a ping.
+        if len(result.reply_targets) == 1 and result.draft_message:
+            uid = result.reply_targets[0].user_id
+            name = None
+            for p in result.participants:
+                if p.user_id == uid and p.name:
+                    name = p.name.strip()
+                    break
+            if not name:
+                for msg in reversed(messages):
+                    if msg.author.id == uid:
+                        name = display_name(msg.author)
+                        break
+            if name:
+                dm = result.draft_message
+                if dm.lower().startswith(name.lower()):
+                    dm = dm[len(name) :].lstrip(" \t\r\n,.:;-\"")
+                    result.draft_message = dm
+
+    async def on_ready(self) -> None:
+        logger.info("Logged in as %s", self.user)
+        if self.settings.debug_logs:
+            logger.info("Debug logs enabled")
+            logger.info("DB path: %s", self.settings.db_path)
+            logger.info(
+                "OpenAI model=%s image_detail=%s max_image_dim=%s",
+                self.settings.openai_model,
+                self.settings.openai_image_detail,
+                self.settings.openai_max_image_dim,
+            )
+        if self.settings.auto_mod_default_channel_id:
+            logger.info("Auto mod enabled default_channel_id=%s", self.settings.auto_mod_default_channel_id)
+        else:
+            logger.info("Auto mod disabled (AUTO_MOD_DEFAULT_CHANNEL_ID not set)")
+        await self.memory_store.connect()
+        await self.view_store.connect()
+        await self._register_commands()
+        await self._restore_views()
+
+    async def on_message(self, message: discord.Message) -> None:
+        if not self.settings.auto_mod_default_channel_id:
+            return
+        if message.author.bot:
+            return
+        if not message.guild:
+            return
+        if not message.role_mentions:
+            return
+        if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
+            return
+
+        source_parent = message.channel.parent if isinstance(message.channel, discord.Thread) else message.channel
+        if isinstance(source_parent, discord.TextChannel):
+            if source_parent.name.endswith("-news"):
+                return
+            category = source_parent.category
+            if category and category.name in DEFAULT_AUTO_IGNORE_CATEGORY_NAMES:
+                return
+        else:
+            return
+
+        # Non-mod only.
+        try:
+            config = await self.memory_store.get_guild_config(message.guild.id)
+        except RuntimeError:
+            return
+        mod_role_id = config.get("mod_role_id") or self.settings.mod_role_id
+        member = message.author if isinstance(message.author, discord.Member) else None
+        if member is None:
+            try:
+                member = await message.guild.fetch_member(message.author.id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return
+        if is_mod(member, mod_role_id):
+            return
+
+        asyncio.create_task(self._handle_auto_mod_ping(message, mod_role_id=mod_role_id))
+
+    async def _handle_auto_mod_ping(self, message: discord.Message, *, mod_role_id: int | None) -> None:
+        guild = message.guild
+        if not guild:
+            return
+        if not self.settings.auto_mod_default_channel_id:
+            return
+        channel = message.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return
+
+        source_parent = channel.parent if isinstance(channel, discord.Thread) else channel
+        if not isinstance(source_parent, discord.TextChannel):
+            return
+
+        try:
+            auto_cfg = await self.memory_store.get_auto_mod_config(guild.id)
+            exempt_raw = auto_cfg.get("exempt_suffix")
+            exempt_suffix = str(exempt_raw) if isinstance(exempt_raw, str) and exempt_raw else "-news"
+            cooldown_raw = auto_cfg.get("cooldown_s")
+            try:
+                cooldown_s = int(cooldown_raw) if cooldown_raw is not None else 180
+            except (TypeError, ValueError):
+                cooldown_s = 180
+            ignored_category_ids = set(await self.memory_store.list_auto_mod_ignored_categories(guild.id))
+            routes = await self.memory_store.list_auto_mod_routes(guild.id)
+        except RuntimeError:
+            return
+        except Exception:
+            logger.exception("Auto mod config load failed")
+            return
+
+        if source_parent.name.endswith(exempt_suffix):
+            return
+        category = source_parent.category
+        if category and (category.id in ignored_category_ids or category.name in DEFAULT_AUTO_IGNORE_CATEGORY_NAMES):
+            return
+
+        route_map = {role_id: channel_id for role_id, channel_id in routes}
+        mod_channel_ids = set(route_map.values())
+        mod_channel_ids.add(self.settings.auto_mod_default_channel_id)
+        if source_parent.id in mod_channel_ids:
+            return
+
+        key = (guild.id, source_parent.id)
+        now_mono = time.monotonic()
+        last = self._auto_last_run.get(key)
+        if last is not None and now_mono - last < cooldown_s:
+            return
+        self._auto_last_run[key] = now_mono
+
+        dest_channel_id: int | None = None
+        for role in message.role_mentions:
+            if role.id in route_map:
+                dest_channel_id = route_map[role.id]
+                break
+        if dest_channel_id is None:
+            dest_channel_id = self.settings.auto_mod_default_channel_id
+
+        if not dest_channel_id:
+            return
+        if dest_channel_id == source_parent.id:
+            return
+
+        dest_channel = guild.get_channel(dest_channel_id)
+        if not isinstance(dest_channel, discord.TextChannel):
+            try:
+                fetched = await guild.fetch_channel(dest_channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                fetched = None
+            dest_channel = fetched if isinstance(fetched, discord.TextChannel) else None
+        if not isinstance(dest_channel, discord.TextChannel):
+            logger.info(
+                "Auto mod dest channel not found guild=%s channel_id=%s",
+                guild.id,
+                dest_channel_id,
+            )
+            return
+
+        logger.info(
+            "AUTO /mod trigger guild=%s(%r) src=%s(%r) user=%s(%r) roles=%s dest=%s(%r) ping=%s",
+            guild.id,
+            guild.name,
+            source_parent.id,
+            source_parent.name,
+            message.author.id,
+            display_name(message.author),
+            ",".join(f"{r.id}(@{r.name})" for r in message.role_mentions),
+            dest_channel.id,
+            dest_channel.name,
+            message.id,
+        )
+
+        # Fetch context ending at the ping.
+        max_limit = self.settings.max_limit
+        use_limit = min(max(self.settings.default_limit, 1), max_limit)
+        try:
+            messages = await self._fetch_recent_messages_ending_at(
+                channel, limit=use_limit, end_message=message
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            return
+        if not messages:
+            return
+
+        now = discord.utils.utcnow()
+        oldest = messages[0].created_at
+        scan_label = f"{len(messages)} msgs | {human_timedelta(now - oldest)} ago -> now"
+
+        role_names = ", ".join(f"@{r.name}" for r in message.role_mentions)
+        ctx = (
+            f"guild={guild.id}({guild.name!r}) "
+            f"channel={getattr(channel, 'id', None)}({getattr(channel, 'name', None)!r}) "
+            f"user={message.author.id}({display_name(message.author)!r})"
+        )
+        try:
+            result, raw_result = await self._analyze_incident_messages(
+                guild_id=guild.id,
+                messages=messages,
+                mod_role_id=mod_role_id,
+                anchor_message_id=message.id,
+                ctx=ctx,
+            )
+        except AuthenticationError:
+            logger.exception("OpenAI auth error during auto /mod")
+            return
+        except Exception:
+            logger.exception("Auto /mod failed")
+            return
+
+        ping_author = display_name(message.author)
+        context = (
+            f"Trigger: {ping_author} pinged {role_names} in {source_parent.mention} "
+            f"([jump]({message.jump_url}))"
+        )
+        embed = self._build_incident_embed(
+            result,
+            title="Auto Mod Brief",
+            scan_label=scan_label,
+            context=context,
+        )
+
+        action_participants: list[dict[str, Any]] = []
+        seen_users: set[int] = set()
+        for msg in messages:
+            user_id = msg.author.id
+            if user_id in seen_users:
+                continue
+            seen_users.add(user_id)
+            m = msg.author if isinstance(msg.author, discord.Member) else None
+            action_participants.append(
+                {
+                    "user_id": user_id,
+                    "name": display_name(msg.author),
+                    "role": "mod" if is_mod(m, mod_role_id) else "member",
+                }
+            )
+            if len(action_participants) >= 25:
+                break
+
+        view_payload = IncidentViewPayload(
+            draft_message=result.draft_message,
+            reply_targets=[t.model_dump() for t in result.reply_targets],
+            draft_replies=[r.model_dump() for r in result.draft_replies],
+            memory_suggestions=result.memory_suggestions.model_dump(),
+            mod_role_id=mod_role_id,
+            participants=action_participants,
+            evidence_quotes=[q.model_dump() for q in result.evidence_quotes],
+            source_channel_id=channel.id,
+            allow_post=True,
+            allow_actions=True,
+            handled=False,
+        )
+        view = IncidentView(
+            payload=view_payload,
+            memory_store=self.memory_store,
+            view_store=self.view_store,
+        )
+        try:
+            posted = await dest_channel.send(
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+                silent=True,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            return
+        record = ViewRecord(
+            message_id=posted.id,
+            channel_id=posted.channel.id,
+            guild_id=posted.guild.id if posted.guild else 0,
+            payload=view_payload.to_dict(),
+            created_at=time.time(),
+        )
+        await self.view_store.save_view(record)
+
+        asyncio.create_task(
+            self._maybe_update_brief_with_images(
+                message=posted,
+                view=view,
+                base_result=result,
+                base_raw_result=raw_result,
+                messages=messages,
+                scan_label=scan_label,
+                title="Auto Mod Brief",
+                context=context,
+                action_participants=action_participants,
+                mod_role_id=mod_role_id,
+                persist_view=True,
+                ctx=ctx,
+            )
+        )
+
+    async def _register_commands(self) -> None:
+        # on_ready can fire multiple times on reconnect; keep this idempotent.
+        self.tree.clear_commands(guild=None)
+        self.tree.add_command(
+            app_commands.Command(
+                name="mod",
+                description="Analyze recent messages and suggest moderation steps.",
+                callback=self._mod_command,
+            )
+        )
+        self.tree.add_command(
+            app_commands.ContextMenu(
+                name="Mod",
+                callback=self._mod_message_context,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="incident_config",
+                description="Configure mod assistant rules channel or mod role.",
+                callback=self._mod_config,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="incident_rules_sync",
+                description="Sync and summarize configured rules channel.",
+                callback=self._mod_rules_sync,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="incident_memory_add",
+                description="Add a server memory note.",
+                callback=self._mod_memory_add,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="incident_memory_list",
+                description="List recent server memory notes.",
+                callback=self._mod_memory_list,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="incident_memory_reset",
+                description="Clear server and user memory.",
+                callback=self._mod_memory_reset,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="incident_auto_route_set",
+                description="Route role pings to a mod channel.",
+                callback=self._incident_auto_route_set,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="incident_auto_route_clear",
+                description="Remove a role ping route.",
+                callback=self._incident_auto_route_clear,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="incident_auto_route_list",
+                description="List role ping routes.",
+                callback=self._incident_auto_route_list,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="incident_auto_ignore_add",
+                description="Ignore pings in a category.",
+                callback=self._incident_auto_ignore_add,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="incident_auto_ignore_remove",
+                description="Stop ignoring pings in a category.",
+                callback=self._incident_auto_ignore_remove,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="incident_auto_ignore_list",
+                description="List ignored categories for auto /mod.",
+                callback=self._incident_auto_ignore_list,
+            )
+        )
+        try:
+            synced = await self.tree.sync()
+        except Exception:
+            logger.exception("Slash command sync failed")
+            return
+        logger.info(
+            "Synced %s global app commands: %s",
+            len(synced),
+            ", ".join(cmd.name for cmd in synced),
+        )
+
+    async def _mod_config(
+        self,
+        interaction: discord.Interaction,
+        rules_channel: discord.TextChannel | None = None,
+        mod_role: discord.Role | None = None,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(
+            interaction,
+            "incident_config",
+            rules_channel_id=rules_channel.id if rules_channel else None,
+            mod_role_id=mod_role.id if mod_role else None,
+        )
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if not is_mod(member, self.settings.mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        await self.memory_store.set_guild_config(
+            interaction.guild.id,
+            rules_channel_id=rules_channel.id if rules_channel else None,
+            mod_role_id=mod_role.id if mod_role else None,
+        )
+        new_config = await self.memory_store.get_guild_config(interaction.guild.id)
+        self._dlog(
+            interaction,
+            "Config now rules_channel_id=%s mod_role_id=%s",
+            new_config.get("rules_channel_id"),
+            new_config.get("mod_role_id"),
+        )
+        await interaction.response.send_message("Config saved.", ephemeral=True)
+
+    async def _mod_rules_sync(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(interaction, "incident_rules_sync")
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if not is_mod(member, self.settings.mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        config = await self.memory_store.get_guild_config(interaction.guild.id)
+        rules_channel_id = config.get("rules_channel_id")
+        if not rules_channel_id:
+            await interaction.response.send_message("Rules channel not configured.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        channel = interaction.guild.get_channel(rules_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.followup.send("Rules channel not found.", ephemeral=True)
+            return
+        t0 = time.monotonic()
+        rules_text, scanned, kept = await self._fetch_all_text(channel)
+        self._dlog(
+            interaction,
+            "Rules fetch scanned=%s kept=%s chars=%s in %.2fs",
+            scanned,
+            kept,
+            len(rules_text),
+            time.monotonic() - t0,
+        )
+        if not rules_text.strip():
+            await interaction.followup.send("Rules channel has no text to summarize.", ephemeral=True)
+            return
+        openai_settings = OpenAISettings(
+            api_key=self.settings.openai_api_key,
+            model=self.settings.openai_model,
+            image_detail=self.settings.openai_image_detail,
+            debug_logs=self.settings.debug_logs,
+        )
+        try:
+            self._dlog(
+                interaction,
+                "OpenAI summarize_rules model=%s chars=%s",
+                openai_settings.model,
+                len(rules_text),
+            )
+            summary = await asyncio.to_thread(summarize_rules, self.openai, openai_settings, rules_text)
+        except AuthenticationError as exc:
+            logger.exception("OpenAI auth error during rules sync")
+            await interaction.followup.send(
+                "OpenAI auth error while summarizing rules. "
+                "If you are using a restricted key, enable the `model.request` scope (and `responses`). "
+                f"Details: {exc}",
+                ephemeral=True,
+            )
+            return
+        except Exception as exc:
+            logger.exception("Rules summary failed")
+            if self.settings.debug_logs:
+                await interaction.followup.send(
+                    truncate(f"Failed to summarize rules: {exc}", 1800),
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send("Failed to summarize rules.", ephemeral=True)
+            return
+        rule_count = 0
+        if isinstance(summary, dict):
+            rules = summary.get("rules")
+            if isinstance(rules, list):
+                rule_count = len(rules)
+        self._dlog(interaction, "Rules summary produced rules=%s", rule_count)
+        await self.memory_store.set_rules_memory(interaction.guild.id, json.dumps(summary, ensure_ascii=True))
+        self._dlog(interaction, "Rules memory saved")
+        await interaction.followup.send("Rules synced.", ephemeral=True)
+
+    async def _mod_memory_add(self, interaction: discord.Interaction, text: str) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(interaction, "incident_memory_add", chars=len(text))
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if not is_mod(member, self.settings.mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        await self.memory_store.add_server_memory(interaction.guild.id, text.strip())
+        self._dlog(interaction, "Server memory note saved")
+        await interaction.response.send_message("Memory saved.", ephemeral=True)
+
+    async def _mod_memory_list(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(interaction, "incident_memory_list")
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if not is_mod(member, self.settings.mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        notes = await self.memory_store.list_server_memory(interaction.guild.id, limit=10)
+        self._dlog(interaction, "Server memory notes=%s", len(notes))
+        if not notes:
+            await interaction.response.send_message("No memory notes saved.", ephemeral=True)
+            return
+        formatted = "\n".join(f"- {note}" for note in notes)
+        await interaction.response.send_message(formatted, ephemeral=True)
+
+    async def _mod_memory_reset(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(interaction, "incident_memory_reset")
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if not is_mod(member, self.settings.mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        await self.memory_store.delete_server_memory(interaction.guild.id)
+        await self.memory_store.delete_user_memory(interaction.guild.id)
+        self._dlog(interaction, "Server/user memory cleared")
+        await interaction.response.send_message("Memory cleared.", ephemeral=True)
+
+    async def _incident_auto_route_set(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+        channel: discord.TextChannel,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(interaction, "incident_auto_route_set", role_id=role.id, channel_id=channel.id)
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        config = await self.memory_store.get_guild_config(interaction.guild.id)
+        mod_role_id = config.get("mod_role_id") or self.settings.mod_role_id
+        if not is_mod(member, mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        await self.memory_store.set_auto_mod_route(interaction.guild.id, role.id, channel.id)
+        await interaction.response.send_message(
+            f"Auto mod route set: @{role.name} -> {channel.mention}", ephemeral=True
+        )
+
+    async def _incident_auto_route_clear(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(interaction, "incident_auto_route_clear", role_id=role.id)
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        config = await self.memory_store.get_guild_config(interaction.guild.id)
+        mod_role_id = config.get("mod_role_id") or self.settings.mod_role_id
+        if not is_mod(member, mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        await self.memory_store.delete_auto_mod_route(interaction.guild.id, role.id)
+        await interaction.response.send_message(
+            f"Auto mod route cleared for @{role.name}.", ephemeral=True
+        )
+
+    async def _incident_auto_route_list(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(interaction, "incident_auto_route_list")
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        config = await self.memory_store.get_guild_config(interaction.guild.id)
+        mod_role_id = config.get("mod_role_id") or self.settings.mod_role_id
+        if not is_mod(member, mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        routes = await self.memory_store.list_auto_mod_routes(interaction.guild.id)
+        if not routes:
+            await interaction.response.send_message("No auto mod routes configured.", ephemeral=True)
+            return
+        lines: list[str] = []
+        for role_id, channel_id in routes:
+            role_obj = interaction.guild.get_role(role_id)
+            role_label = f"@{role_obj.name}" if role_obj else f"role:{role_id}"
+            ch = interaction.guild.get_channel(channel_id)
+            channel_label = ch.mention if isinstance(ch, discord.TextChannel) else f"channel:{channel_id}"
+            lines.append(f"- {role_label} -> {channel_label}")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    async def _incident_auto_ignore_add(
+        self,
+        interaction: discord.Interaction,
+        category: discord.CategoryChannel,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(interaction, "incident_auto_ignore_add", category_id=category.id)
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        config = await self.memory_store.get_guild_config(interaction.guild.id)
+        mod_role_id = config.get("mod_role_id") or self.settings.mod_role_id
+        if not is_mod(member, mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        await self.memory_store.add_auto_mod_ignored_category(interaction.guild.id, category.id)
+        await interaction.response.send_message(
+            f"Auto mod will ignore pings in category: {category.name}", ephemeral=True
+        )
+
+    async def _incident_auto_ignore_remove(
+        self,
+        interaction: discord.Interaction,
+        category: discord.CategoryChannel,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(interaction, "incident_auto_ignore_remove", category_id=category.id)
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        config = await self.memory_store.get_guild_config(interaction.guild.id)
+        mod_role_id = config.get("mod_role_id") or self.settings.mod_role_id
+        if not is_mod(member, mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        await self.memory_store.delete_auto_mod_ignored_category(interaction.guild.id, category.id)
+        await interaction.response.send_message(
+            f"Auto mod will no longer ignore category: {category.name}", ephemeral=True
+        )
+
+    async def _incident_auto_ignore_list(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(interaction, "incident_auto_ignore_list")
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        config = await self.memory_store.get_guild_config(interaction.guild.id)
+        mod_role_id = config.get("mod_role_id") or self.settings.mod_role_id
+        if not is_mod(member, mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        ids = await self.memory_store.list_auto_mod_ignored_categories(interaction.guild.id)
+        if not ids:
+            await interaction.response.send_message("No ignored categories configured.", ephemeral=True)
+            return
+        lines: list[str] = []
+        for category_id in ids:
+            cat = interaction.guild.get_channel(category_id)
+            label = cat.name if isinstance(cat, discord.CategoryChannel) else str(category_id)
+            lines.append(f"- {label} ({category_id})")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    async def _mod_command(
+        self,
+        interaction: discord.Interaction,
+        limit: int | None = None,
+    ) -> None:
+        if not interaction.guild or not interaction.channel:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(
+            interaction,
+            "mod",
+            limit=limit,
+        )
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        config = await self.memory_store.get_guild_config(interaction.guild.id)
+        mod_role_id = config.get("mod_role_id") or self.settings.mod_role_id
+        self._dlog(interaction, "Resolved mod_role_id=%s", mod_role_id)
+        if not is_mod(member, mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        t_cmd = time.monotonic()
+        max_limit = self.settings.max_limit
+        use_limit = min(max(limit or self.settings.default_limit, 1), max_limit)
+        self._dlog(interaction, "Using limit=%s (max=%s)", use_limit, max_limit)
+        channel = interaction.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.edit_original_response(content="Unsupported channel type.")
+            return
+        t0 = time.monotonic()
+        messages = await self._fetch_recent_messages(channel, use_limit)
+        self._dlog(interaction, "Fetched messages=%s in %.2fs", len(messages), time.monotonic() - t0)
+        if not messages:
+            await interaction.edit_original_response(content="No messages found.")
+            return
+
+        now = discord.utils.utcnow()
+        oldest = messages[0].created_at
+        scan_label = f"{len(messages)} msgs | {human_timedelta(now - oldest)} ago -> now"
+        try:
+            result, raw_result = await self._analyze_incident_messages(
+                guild_id=interaction.guild.id,
+                messages=messages,
+                mod_role_id=mod_role_id,
+                ctx=self._ctx(interaction),
+            )
+        except AuthenticationError as exc:
+            logger.exception("OpenAI auth error during incident analysis")
+            await interaction.edit_original_response(
+                content=(
+                    "OpenAI auth error while running /mod. "
+                    "If you are using a restricted key, enable the `model.request` scope. "
+                    f"Details: {exc}"
+                )
+            )
+            return
+        except Exception as exc:
+            logger.exception("Incident analysis failed")
+            if self.settings.debug_logs:
+                await interaction.edit_original_response(
+                    content=truncate(f"Incident analysis failed: {exc}", 1800)
+                )
+            else:
+                await interaction.edit_original_response(content="Incident analysis failed.")
+            return
+        embed = self._build_incident_embed(result, scan_label=scan_label)
+
+        action_participants: list[dict[str, Any]] = []
+        seen_users: set[int] = set()
+        for message in messages:
+            user_id = message.author.id
+            if user_id in seen_users:
+                continue
+            seen_users.add(user_id)
+            member = message.author if isinstance(message.author, discord.Member) else None
+            action_participants.append(
+                {
+                    "user_id": user_id,
+                    "name": display_name(message.author),
+                    "role": "mod" if is_mod(member, mod_role_id) else "member",
+                }
+            )
+            if len(action_participants) >= 25:
+                break
+        view_payload = IncidentViewPayload(
+            draft_message=result.draft_message,
+            reply_targets=[t.model_dump() for t in result.reply_targets],
+            draft_replies=[r.model_dump() for r in result.draft_replies],
+            memory_suggestions=result.memory_suggestions.model_dump(),
+            mod_role_id=mod_role_id,
+            participants=action_participants,
+            evidence_quotes=[q.model_dump() for q in result.evidence_quotes],
+            source_channel_id=channel.id,
+            allow_post=True,
+            allow_actions=True,
+            handled=False,
+        )
+        view = IncidentView(
+            payload=view_payload,
+            memory_store=self.memory_store,
+            view_store=self.view_store,
+        )
+        posted = await interaction.edit_original_response(embed=embed, view=view)
+        self._dlog(interaction, "Completed /mod in %.2fs", time.monotonic() - t_cmd)
+
+        # Background image refinement (only updates if images are actually relevant).
+        asyncio.create_task(
+            self._maybe_update_brief_with_images(
+                message=posted,
+                view=view,
+                base_result=result,
+                base_raw_result=raw_result,
+                messages=messages,
+                scan_label=scan_label,
+                title="Mod Brief",
+                context=None,
+                action_participants=action_participants,
+                mod_role_id=mod_role_id,
+                persist_view=False,
+                ctx=self._ctx(interaction),
+            )
+        )
+
+    async def _mod_message_context(
+        self,
+        interaction: discord.Interaction,
+        message: discord.Message,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(
+            interaction,
+            "mod_message_context",
+            message_id=message.id,
+            channel_id=getattr(message.channel, "id", None),
+        )
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        config = await self.memory_store.get_guild_config(interaction.guild.id)
+        mod_role_id = config.get("mod_role_id") or self.settings.mod_role_id
+        if not is_mod(member, mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        channel = message.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.edit_original_response(content="Unsupported channel type.")
+            return
+
+        after_limit = 10
+        max_total = self.settings.max_limit
+        before_limit = min(self.settings.default_limit, max(max_total - after_limit, 1))
+
+        t0 = time.monotonic()
+        before_messages = await self._fetch_recent_messages_ending_at(
+            channel, limit=before_limit, end_message=message
+        )
+        if not before_messages or before_messages[-1].id != message.id:
+            before_messages.append(message)
+        self._dlog(
+            interaction,
+            "Context fetch before+anchor=%s in %.2fs",
+            len(before_messages),
+            time.monotonic() - t0,
+        )
+
+        t0 = time.monotonic()
+        after_messages: list[discord.Message] = []
+        async for msg in channel.history(limit=after_limit, after=message, oldest_first=True):
+            if msg.author.bot:
+                continue
+            after_messages.append(msg)
+        self._dlog(
+            interaction,
+            "Context fetch after=%s in %.2fs",
+            len(after_messages),
+            time.monotonic() - t0,
+        )
+
+        window = before_messages + after_messages
+        if not window:
+            await interaction.edit_original_response(content="No messages found.")
+            return
+
+        oldest = window[0].created_at
+        latest = window[-1].created_at
+        before_count = max(len(before_messages) - 1, 0)
+        after_count = len(after_messages)
+        scan_label = f"{before_count} before + {after_count} after | {human_timedelta(latest - oldest)} span"
+        context = f"Anchor: [jump]({message.jump_url}) in {channel.mention}"
+
+        try:
+            result, raw_result = await self._analyze_incident_messages(
+                guild_id=interaction.guild.id,
+                messages=window,
+                mod_role_id=mod_role_id,
+                anchor_message_id=message.id,
+                ctx=self._ctx(interaction),
+            )
+        except AuthenticationError as exc:
+            logger.exception("OpenAI auth error during context menu analysis")
+            await interaction.edit_original_response(
+                content=(
+                    "OpenAI auth error while running Mod (message). "
+                    "If you are using a restricted key, enable the `model.request` scope. "
+                    f"Details: {exc}"
+                )
+            )
+            return
+        except Exception as exc:
+            logger.exception("Context menu analysis failed")
+            if self.settings.debug_logs:
+                await interaction.edit_original_response(
+                    content=truncate(f"Context menu analysis failed: {exc}", 1800)
+                )
+            else:
+                await interaction.edit_original_response(content="Context menu analysis failed.")
+            return
+
+        embed = self._build_incident_embed(result, scan_label=scan_label, context=context)
+
+        action_participants: list[dict[str, Any]] = []
+        seen_users: set[int] = set()
+        for msg in window:
+            user_id = msg.author.id
+            if user_id in seen_users:
+                continue
+            seen_users.add(user_id)
+            m = msg.author if isinstance(msg.author, discord.Member) else None
+            action_participants.append(
+                {
+                    "user_id": user_id,
+                    "name": display_name(msg.author),
+                    "role": "mod" if is_mod(m, mod_role_id) else "member",
+                }
+            )
+            if len(action_participants) >= 25:
+                break
+
+        view_payload = IncidentViewPayload(
+            draft_message=result.draft_message,
+            reply_targets=[t.model_dump() for t in result.reply_targets],
+            draft_replies=[r.model_dump() for r in result.draft_replies],
+            memory_suggestions=result.memory_suggestions.model_dump(),
+            mod_role_id=mod_role_id,
+            participants=action_participants,
+            evidence_quotes=[q.model_dump() for q in result.evidence_quotes],
+            source_channel_id=channel.id,
+            allow_post=True,
+            allow_actions=True,
+            handled=False,
+        )
+        view = IncidentView(
+            payload=view_payload,
+            memory_store=self.memory_store,
+            view_store=self.view_store,
+        )
+        posted = await interaction.edit_original_response(embed=embed, view=view)
+
+        asyncio.create_task(
+            self._maybe_update_brief_with_images(
+                message=posted,
+                view=view,
+                base_result=result,
+                base_raw_result=raw_result,
+                messages=window,
+                scan_label=scan_label,
+                title="Mod Brief",
+                context=context,
+                action_participants=action_participants,
+                mod_role_id=mod_role_id,
+                persist_view=False,
+                ctx=self._ctx(interaction),
+            )
+        )
+
+    async def _analyze_incident_messages(
+        self,
+        *,
+        guild_id: int,
+        messages: list[discord.Message],
+        mod_role_id: int | None,
+        anchor_message_id: int | None = None,
+        ctx: str,
+    ) -> tuple[IncidentResult, dict[str, Any]]:
+        # Text-first analysis. Images are handled in a background refinement step.
+        rules_task = asyncio.create_task(self.memory_store.get_rules_memory(guild_id))
+        server_task = asyncio.create_task(self.memory_store.list_server_memory(guild_id, limit=5))
+        user_task = asyncio.create_task(self._collect_user_memory(guild_id, messages))
+
+        openai_settings = OpenAISettings(
+            api_key=self.settings.openai_api_key,
+            model=self.settings.openai_model,
+            image_detail=self.settings.openai_image_detail,
+            debug_logs=self.settings.debug_logs,
+        )
+
+        rules_memory_raw = await rules_task
+        rules_memory: Any = rules_memory_raw or "(rules not configured)"
+        if rules_memory_raw:
+            try:
+                rules_memory = json.loads(rules_memory_raw)
+            except json.JSONDecodeError:
+                rules_memory = rules_memory_raw
+        server_memory = await server_task
+        user_memory = await user_task
+
+        image_ids: set[str] = set()
+
+        self._dlog_ctx(
+            ctx,
+            "Context rules=%s server_memory=%s user_memory=%s images=%s",
+            "yes" if rules_memory_raw else "no",
+            len(server_memory),
+            len(user_memory),
+            len(image_ids),
+        )
+
+        payload = {
+            "rules_memory": rules_memory,
+            "server_memory": server_memory,
+            "user_memory": user_memory,
+            "messages": self._compress_messages(messages, image_ids),
+        }
+        if anchor_message_id is not None:
+            payload["anchor_message_id"] = anchor_message_id
+
+        self._dlog_ctx(ctx, "OpenAI analyze_incident model=%s", openai_settings.model)
+        t0 = time.monotonic()
+
+        async def _run_analysis() -> dict[str, Any]:
+            client = create_client(self.settings.openai_api_key)
+            try:
+                return await asyncio.to_thread(analyze_incident, client, openai_settings, payload)
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+        raw_result = await asyncio.create_task(_run_analysis())
+        result = parse_incident_result(raw_result)
+
+        self._postprocess_result(result, messages)
+        self._dlog_ctx(ctx, "analyze_incident parsed in %.2fs", time.monotonic() - t0)
+
+        message_links = {m.id: m.jump_url for m in messages}
+        for q in result.evidence_quotes:
+            if q.link:
+                continue
+            if q.message_id and q.message_id in message_links:
+                q.link = message_links[q.message_id]
+        for note in result.memory_suggestions.user_notes:
+            if note.evidence_link:
+                continue
+            if note.evidence_message_id and note.evidence_message_id in message_links:
+                note.evidence_link = message_links[note.evidence_message_id]
+
+        self._dlog_ctx(
+            ctx,
+            "Result conf=%.2f participants=%s rules=%s recs=%s evidence=%s reply_targets=%s draft_len=%s memory server=%s user=%s",
+            result.confidence,
+            len(result.participants),
+            len(result.rule_refs),
+            len(result.recommendations),
+            len(result.evidence_quotes),
+            len(result.reply_targets),
+            len(result.draft_message),
+            len(result.memory_suggestions.server_notes),
+            len(result.memory_suggestions.user_notes),
+        )
+        return result, raw_result
+
+    @staticmethod
+    def _incident_signature(result: IncidentResult) -> tuple[object, ...]:
+        return (
+            result.summary,
+            tuple((p.user_id, p.name, p.role, p.notes or "") for p in result.participants),
+            tuple(result.signals),
+            tuple((r.id, r.reason) for r in result.rule_refs),
+            tuple(result.recommendations),
+            result.draft_message,
+            tuple((t.user_id, t.message_id) for t in result.reply_targets),
+            tuple((d.user_id, d.text) for d in result.draft_replies),
+            tuple((q.message_id, q.quote) for q in result.evidence_quotes),
+            tuple(result.memory_suggestions.server_notes),
+            tuple((n.user_id, n.label, n.evidence_message_id) for n in result.memory_suggestions.user_notes),
+        )
+
+    async def _maybe_update_brief_with_images(
+        self,
+        *,
+        message: Any,
+        view: IncidentView,
+        base_result: IncidentResult,
+        base_raw_result: dict[str, Any],
+        messages: list[discord.Message],
+        scan_label: str,
+        title: str,
+        context: str | None,
+        action_participants: list[dict[str, Any]],
+        mod_role_id: int | None,
+        persist_view: bool,
+        ctx: str,
+    ) -> None:
+        target_user_ids: set[int] = {t.user_id for t in base_result.reply_targets}
+
+        messages_by_id: dict[int, discord.Message] = {m.id: m for m in messages}
+        source_channel = messages[-1].channel if messages else None
+
+        evidence_message_ids: list[int] = []
+        seen_ids: set[int] = set()
+        for q in base_result.evidence_quotes:
+            if q.message_id and q.message_id not in seen_ids:
+                seen_ids.add(q.message_id)
+                evidence_message_ids.append(q.message_id)
+        for t in base_result.reply_targets:
+            if t.message_id and t.message_id not in seen_ids:
+                seen_ids.add(t.message_id)
+                evidence_message_ids.append(t.message_id)
+
+        reply_context_by_ref: dict[int, list[str]] = {}
+        for mid in evidence_message_ids:
+            msg = messages_by_id.get(mid)
+            if msg is None:
+                continue
+            ref = msg.reference
+            ref_id = getattr(ref, "message_id", None) if ref else None
+            if not isinstance(ref_id, int):
+                continue
+            snippet = compress_text(msg.clean_content, max_len=160)
+            if snippet:
+                reply_context_by_ref.setdefault(ref_id, []).append(
+                    f"{display_name(msg.author)}: {snippet}"
+                )
+
+        async def _fetch_message(mid: int) -> discord.Message | None:
+            if mid in messages_by_id:
+                return messages_by_id[mid]
+            if not isinstance(source_channel, (discord.TextChannel, discord.Thread)):
+                return None
+            try:
+                fetched = await source_channel.fetch_message(mid)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return None
+            return fetched
+
+        candidate_messages: list[tuple[int, discord.Message, list[str]]] = []
+        candidate_ids: set[int] = set()
+
+        # 0) Images from messages being replied to by evidence messages (reply-chain context).
+        for ref_id, reply_lines in reply_context_by_ref.items():
+            if ref_id in candidate_ids:
+                continue
+            ref_msg = await _fetch_message(ref_id)
+            if ref_msg is None:
+                continue
+            candidate_ids.add(ref_id)
+            candidate_messages.append((0, ref_msg, reply_lines))
+
+        # 1) Images directly in evidence messages.
+        for mid in evidence_message_ids:
+            if mid in candidate_ids:
+                continue
+            msg = messages_by_id.get(mid)
+            if msg is None:
+                continue
+            candidate_ids.add(mid)
+            candidate_messages.append((1, msg, []))
+
+        # 2) Images posted by the targeted users (if any).
+        if target_user_ids:
+            for msg in messages:
+                if msg.id in candidate_ids:
+                    continue
+                if msg.author.id not in target_user_ids:
+                    continue
+                candidate_ids.add(msg.id)
+                candidate_messages.append((2, msg, []))
+
+        # Collect up to a few media items (attachments + stickers + embed thumbnails).
+        max_media = 3
+        max_image_bytes = 10_000_000
+        max_gif_bytes = 5_000_000
+        max_url_bytes = 4_000_000
+        max_gif_url_bytes = 5_000_000
+
+        image_payloads: list[dict[str, Any]] = []
+        image_meta: dict[str, dict[str, Any]] = {}
+        seen_media: set[str] = set()
+
+        for _, msg, reply_lines in sorted(candidate_messages, key=lambda t: (t[0], t[1].created_at)):
+            if len(image_payloads) >= max_media:
+                break
+
+            msg_text = compress_text(msg.clean_content, max_len=160)
+            base_context_parts = [
+                f"msg_id={msg.id}",
+                f"author={display_name(msg.author)}",
+            ]
+            if msg_text:
+                base_context_parts.append(f"text={msg_text}")
+            if reply_lines:
+                base_context_parts.append("replied_by=" + " | ".join(reply_lines[:2]))
+            base_context = " | ".join(base_context_parts)
+
+            for attachment in msg.attachments:
+                if len(image_payloads) >= max_media:
+                    break
+                if not self._is_image_attachment(attachment):
+                    continue
+                key = f"att:{attachment.id}"
+                if key in seen_media:
+                    continue
+                seen_media.add(key)
+                is_gif = self._is_gif_attachment(attachment)
+                size_limit = max_gif_bytes if is_gif else max_image_bytes
+                if attachment.size and attachment.size > size_limit:
+                    continue
+                try:
+                    data = await attachment.read()
+                except Exception:
+                    continue
+                resized, content_type, _, _ = resize_image_bytes(
+                    data, self.settings.openai_max_image_dim
+                )
+                image_id = f"m{msg.id}_att{attachment.id}"
+                image_payloads.append(
+                    {
+                        "id": image_id,
+                        "data_url": to_data_url(resized, content_type),
+                        "context": base_context,
+                    }
+                )
+                image_meta[image_id] = {
+                    "message_id": msg.id,
+                    "author_name": display_name(msg.author),
+                }
+
+            for item in self._extract_message_media_urls(msg):
+                if len(image_payloads) >= max_media:
+                    break
+                url = item.get("url")
+                if not isinstance(url, str) or not url:
+                    continue
+                key = f"url:{url}"
+                if key in seen_media:
+                    continue
+                seen_media.add(key)
+                is_gif = bool(item.get("is_gif", False))
+                limit = max_gif_url_bytes if is_gif else max_url_bytes
+                data = await self._fetch_url_bytes(url, max_bytes=limit)
+                if not data:
+                    continue
+                try:
+                    resized, content_type, _, _ = resize_image_bytes(
+                        data, self.settings.openai_max_image_dim
+                    )
+                except Exception:
+                    continue
+
+                kind = str(item.get("kind") or "url")
+                sticker_id = item.get("sticker_id")
+                suffix = ""
+                if kind == "sticker" and sticker_id is not None:
+                    suffix = f"stk{sticker_id}"
+                else:
+                    suffix = str(abs(hash(url)))[:8]
+                image_id = f"m{msg.id}_{kind}{suffix}"
+                image_payloads.append(
+                    {
+                        "id": image_id,
+                        "data_url": to_data_url(resized, content_type),
+                        "context": base_context,
+                    }
+                )
+                image_meta[image_id] = {
+                    "message_id": msg.id,
+                    "author_name": display_name(msg.author),
+                }
+
+        self._dlog_ctx(ctx, "Background media candidates=%s", len(image_payloads))
+        if not image_payloads:
+            return
+
+        openai_settings = OpenAISettings(
+            api_key=self.settings.openai_api_key,
+            model=self.settings.openai_model,
+            image_detail=self.settings.openai_image_detail,
+            debug_logs=self.settings.debug_logs,
+        )
+
+        # Summarize images and only continue if any are evidence or needed context.
+        t0 = time.monotonic()
+        summarized: list[dict[str, Any]] = []
+        client = create_client(self.settings.openai_api_key)
+        try:
+            summarized = await asyncio.to_thread(
+                summarize_images, client, openai_settings, image_payloads
+            )
+        except Exception:
+            logger.exception("Background summarize_images failed")
+            return
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+        self._dlog_ctx(
+            ctx,
+            "Background summarize_images returned=%s in %.2fs",
+            len(summarized),
+            time.monotonic() - t0,
+        )
+
+        relevant_items: list[dict[str, Any]] = []
+        for item in summarized:
+            if not isinstance(item, dict):
+                continue
+            if bool(item.get("is_evidence", False)) or bool(item.get("is_context", False)):
+                relevant_items.append(item)
+        if not relevant_items:
+            return
+
+        image_notes: list[dict[str, Any]] = []
+        for item in relevant_items:
+            image_id = str(item.get("id") or "")
+            note = str(item.get("note") or "").strip()
+            if not image_id or not note:
+                continue
+            meta = image_meta.get(image_id)
+            if not isinstance(meta, dict):
+                continue
+            message_id = meta.get("message_id")
+            if not isinstance(message_id, int):
+                continue
+            author_name = str(meta.get("author_name") or "")
+            image_notes.append(
+                {
+                    "image_id": image_id,
+                    "message_id": message_id,
+                    "author_name": author_name,
+                    "note": note,
+                    "is_evidence": bool(item.get("is_evidence", False)),
+                    "is_context": bool(item.get("is_context", False)),
+                }
+            )
+        if not image_notes:
+            return
+
+        self._dlog_ctx(ctx, "Background refine_incident_with_images images=%s", len(image_notes))
+        t0 = time.monotonic()
+        client = create_client(self.settings.openai_api_key)
+        try:
+            refined_raw = await asyncio.to_thread(
+                refine_incident_with_images,
+                client,
+                openai_settings,
+                base_raw_result,
+                image_notes,
+            )
+        except Exception:
+            logger.exception("Background refine_incident_with_images failed")
+            return
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+        self._dlog_ctx(ctx, "Background refine_incident_with_images in %.2fs", time.monotonic() - t0)
+
+        refined = parse_incident_result(refined_raw)
+
+        self._postprocess_result(refined, messages)
+
+        message_links = {m.id: m.jump_url for m in messages}
+        for q in refined.evidence_quotes:
+            if q.link:
+                continue
+            if q.message_id and q.message_id in message_links:
+                q.link = message_links[q.message_id]
+        for note in refined.memory_suggestions.user_notes:
+            if note.evidence_link:
+                continue
+            if note.evidence_message_id and note.evidence_message_id in message_links:
+                note.evidence_link = message_links[note.evidence_message_id]
+
+        if self._incident_signature(refined) == self._incident_signature(base_result):
+            return
+
+        new_embed = self._build_incident_embed(
+            refined,
+            title=title,
+            scan_label=scan_label,
+            context=context,
+        )
+        new_payload = IncidentViewPayload(
+            draft_message=refined.draft_message,
+            reply_targets=[t.model_dump() for t in refined.reply_targets],
+            draft_replies=[r.model_dump() for r in refined.draft_replies],
+            memory_suggestions=refined.memory_suggestions.model_dump(),
+            mod_role_id=mod_role_id,
+            participants=action_participants,
+            evidence_quotes=[q.model_dump() for q in refined.evidence_quotes],
+            source_channel_id=view.payload.source_channel_id,
+            allow_post=view.payload.allow_post,
+            allow_actions=view.payload.allow_actions,
+            handled=False,
+        )
+        new_view = IncidentView(
+            payload=new_payload,
+            memory_store=self.memory_store,
+            view_store=self.view_store,
+        )
+
+        try:
+            await message.edit(embed=new_embed, view=new_view)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            return
+
+        if persist_view:
+            record = ViewRecord(
+                message_id=message.id,
+                channel_id=message.channel.id,
+                guild_id=message.guild.id if message.guild else 0,
+                payload=new_payload.to_dict(),
+                created_at=time.time(),
+            )
+            await self.view_store.save_view(record)
+
+        self._dlog_ctx(ctx, "Updated brief after image check")
+
+    async def _fetch_recent_messages_ending_at(
+        self,
+        channel: discord.abc.Messageable,
+        *,
+        limit: int,
+        end_message: discord.Message,
+    ) -> list[discord.Message]:
+        messages: list[discord.Message] = []
+        before_limit = max(limit - 1, 0)
+        async for message in channel.history(limit=before_limit, before=end_message):
+            if message.author.bot:
+                continue
+            messages.append(message)
+        out = list(reversed(messages))
+        if not end_message.author.bot:
+            out.append(end_message)
+        return out
+
+    async def _fetch_recent_messages(
+        self, channel: discord.abc.Messageable, limit: int
+    ) -> list[discord.Message]:
+        messages: list[discord.Message] = []
+        async for message in channel.history(limit=limit):
+            if message.author.bot:
+                continue
+            messages.append(message)
+        return list(reversed(messages))
+
+    async def _fetch_all_text(self, channel: discord.TextChannel) -> tuple[str, int, int]:
+        scanned = 0
+        kept = 0
+        parts: list[str] = []
+        async for message in channel.history(limit=None, oldest_first=True):
+            scanned += 1
+            if message.author.bot:
+                continue
+            content = message.clean_content.strip()
+            if content:
+                parts.append(content)
+                kept += 1
+        return "\n".join(parts), scanned, kept
+
+    async def _prepare_images(
+        self, messages: list[discord.Message], *, max_images: int | None = None
+    ) -> tuple[list[dict[str, str]], dict[str, str], int]:
+        image_payloads: list[dict[str, str]] = []
+        image_links: dict[str, str] = {}
+        image_count = 0
+        total_images = 0
+        limit = max_images if max_images is not None else self.settings.max_images_to_analyze
+        max_image_bytes = 10_000_000
+        max_gif_bytes = 5_000_000
+        for message in messages:
+            for attachment in message.attachments:
+                if not self._is_image_attachment(attachment):
+                    continue
+                total_images += 1
+                if image_count >= limit:
+                    continue
+                is_gif = (
+                    (attachment.content_type or "").lower().startswith("image/gif")
+                    or attachment.filename.lower().endswith(".gif")
+                )
+                size_limit = max_gif_bytes if is_gif else max_image_bytes
+                if attachment.size and attachment.size > size_limit:
+                    continue
+                try:
+                    data = await attachment.read()
+                except Exception:
+                    continue
+                resized, content_type, _, _ = resize_image_bytes(data, self.settings.openai_max_image_dim)
+                image_id = f"img_{message.id}_{attachment.id}"
+                image_payloads.append(
+                    {
+                        "id": image_id,
+                        "data_url": to_data_url(resized, content_type),
+                    }
+                )
+                image_links[image_id] = message.jump_url
+                image_count += 1
+        omitted = max(total_images - image_count, 0)
+        return image_payloads, image_links, omitted
+
+    def _compress_messages(
+        self,
+        messages: list[discord.Message],
+        included_image_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        compressed: list[dict[str, Any]] = []
+        for message in messages:
+            content = compress_text(message.clean_content, max_len=300)
+            image_ids: list[str] = []
+            for attachment in message.attachments:
+                if not self._is_image_attachment(attachment):
+                    continue
+                image_id = f"img_{message.id}_{attachment.id}"
+                if image_id in included_image_ids:
+                    image_ids.append(image_id)
+            compressed.append(
+                {
+                    "id": message.id,
+                    "author_id": message.author.id,
+                    "author_name": display_name(message.author),
+                    "content": content,
+                    "image_ids": image_ids,
+                }
+            )
+        return compressed
+
+    async def _collect_user_memory(
+        self, guild_id: int, messages: list[discord.Message]
+    ) -> list[dict[str, Any]]:
+        seen: set[int] = set()
+        memory: list[dict[str, Any]] = []
+        for message in messages:
+            user_id = message.author.id
+            if user_id in seen:
+                continue
+            seen.add(user_id)
+            entries = await self.memory_store.list_user_profile_entries(guild_id, user_id)
+            if not entries:
+                continue
+            summary = "\n".join(f"- {label} (seen {count}x)" for label, count in entries)
+            memory.append({"user_id": user_id, "summary": summary})
+        return memory
+
+    @staticmethod
+    def _is_image_attachment(attachment: discord.Attachment) -> bool:
+        if attachment.content_type and attachment.content_type.startswith("image/"):
+            return True
+        name = attachment.filename.lower()
+        return name.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"))
+
+    @staticmethod
+    def _is_gif_attachment(attachment: discord.Attachment) -> bool:
+        if (attachment.content_type or "").lower().startswith("image/gif"):
+            return True
+        return attachment.filename.lower().endswith(".gif")
+
+    @staticmethod
+    def _is_probably_gif_url(url: str) -> bool:
+        u = url.lower()
+        return ".gif" in u or "tenor" in u or "giphy" in u
+
+    @staticmethod
+    def _extract_embed_media_urls(embed: discord.Embed) -> list[str]:
+        urls: list[str] = []
+        try:
+            image_url = getattr(embed.image, "url", None)
+            if isinstance(image_url, str) and image_url.strip():
+                urls.append(image_url.strip())
+        except Exception:
+            pass
+        try:
+            thumb_url = getattr(embed.thumbnail, "url", None)
+            if isinstance(thumb_url, str) and thumb_url.strip():
+                urls.append(thumb_url.strip())
+        except Exception:
+            pass
+        # De-dupe while preserving order.
+        out: list[str] = []
+        seen: set[str] = set()
+        for u in urls:
+            if u in seen:
+                continue
+            seen.add(u)
+            out.append(u)
+        return out
+
+    def _extract_message_media_urls(self, message: discord.Message) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for sticker in getattr(message, "stickers", []) or []:
+            try:
+                url = sticker.url
+                fmt = sticker.format
+            except Exception:
+                continue
+            if not isinstance(url, str) or not url:
+                continue
+            if url in seen:
+                continue
+            # Skip lottie stickers.
+            if fmt == discord.StickerFormatType.lottie:
+                continue
+            seen.add(url)
+            out.append(
+                {
+                    "kind": "sticker",
+                    "url": url,
+                    "sticker_id": getattr(sticker, "id", None),
+                    "is_gif": fmt == discord.StickerFormatType.gif,
+                }
+            )
+
+        for embed in message.embeds or []:
+            for url in self._extract_embed_media_urls(embed):
+                if url in seen:
+                    continue
+                seen.add(url)
+                out.append({"kind": "embed", "url": url, "is_gif": self._is_probably_gif_url(url)})
+
+        return out
+
+    async def _fetch_url_bytes(self, url: str, *, max_bytes: int, timeout_s: float = 10.0) -> bytes | None:
+        if not url:
+            return None
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_s) as client:
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    length = resp.headers.get("Content-Length")
+                    if length:
+                        try:
+                            if int(length) > max_bytes:
+                                return None
+                        except ValueError:
+                            pass
+                    data = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        data.extend(chunk)
+                        if len(data) > max_bytes:
+                            return None
+                    return bytes(data)
+        except Exception:
+            return None
+
+    def _build_incident_embed(
+        self,
+        result: IncidentResult,
+        *,
+        title: str = "Mod Brief",
+        scan_label: str | None = None,
+        context: str | None = None,
+    ) -> discord.Embed:
+        embed = discord.Embed(title=title, color=discord.Color.orange())
+        lines: list[str] = []
+        if context:
+            lines.append(context)
+        if scan_label:
+            lines.append(scan_label)
+        lines.append(truncate(result.summary, 500))
+        embed.description = "\n".join(lines)
+
+        if result.participants:
+            participants = [
+                f"{p.name}"
+                + (f" ({p.role})" if p.role and p.role not in {"member", "user"} else "")
+                + (f": {p.notes}" if p.notes else "")
+                for p in result.participants[:4]
+            ]
+            embed.add_field(name="Involved", value=truncate("\n".join(participants), 1024), inline=False)
+        if result.signals:
+            embed.add_field(
+                name="Key Moments",
+                value=truncate("\n".join(f"- {s}" for s in result.signals[:4]), 1024),
+                inline=False,
+            )
+        if result.rule_refs:
+            rules = [f"{r.id}: {r.reason}" for r in result.rule_refs[:2]]
+            embed.add_field(name="Rules", value=truncate("\n".join(rules), 1024), inline=False)
+        if result.recommendations:
+            embed.add_field(
+                name="Actions",
+                value=truncate("\n".join(f"- {r}" for r in result.recommendations[:3]), 1024),
+                inline=False,
+            )
+        if result.evidence_quotes:
+            quotes = [f"\"{q.quote}\" [jump]({q.link})" for q in result.evidence_quotes[:3] if q.link]
+            if quotes:
+                embed.add_field(name="Evidence", value=truncate("\n".join(quotes), 1024), inline=False)
+        if result.memory_suggestions.server_notes or result.memory_suggestions.user_notes:
+            lines: list[str] = []
+            for note in result.memory_suggestions.server_notes[:2]:
+                lines.append(f"- server: {note}")
+            for note in result.memory_suggestions.user_notes[:3]:
+                lines.append(f"- user {note.user_id}: {note.label}")
+            embed.add_field(
+                name="Memory Suggestions",
+                value=truncate("\n".join(lines), 1024),
+                inline=False,
+            )
+        draft_lines: list[str] = []
+        if result.draft_replies:
+            for item in result.draft_replies[:3]:
+                text = item.text.strip()
+                if not text:
+                    continue
+                draft_lines.append(f"<@{item.user_id}> {text}".strip())
+        else:
+            prefix = " ".join(f"<@{t.user_id}>" for t in result.reply_targets[:3]).strip()
+            text = result.draft_message.strip()
+            if prefix and text:
+                draft_lines.append(f"{prefix} {text}".strip())
+            elif text:
+                draft_lines.append(text)
+
+        if draft_lines:
+            embed.add_field(
+                name="Draft reply",
+                value=truncate("\n".join(draft_lines), 1024),
+                inline=False,
+            )
+        embed.set_footer(text=f"Conf: {result.confidence:.2f}")
+        return embed
+
+    async def _restore_views(self) -> None:
+        await self.view_store.prune(ttl_s=48 * 3600)
+        records = await self.view_store.load_views()
+        restored = 0
+        for record in records:
+            channel = self.get_channel(record.channel_id)
+            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                await self.view_store.delete_view(record.message_id)
+                continue
+            try:
+                await channel.fetch_message(record.message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                await self.view_store.delete_view(record.message_id)
+                continue
+            payload = record.payload
+            memory_suggestions = payload.get("memory_suggestions")
+            if not isinstance(memory_suggestions, dict):
+                memory_suggestions = {}
+            mod_role_id = payload.get("mod_role_id")
+            if mod_role_id is not None and not isinstance(mod_role_id, int):
+                mod_role_id = None
+            participants = payload.get("participants")
+            if not isinstance(participants, list):
+                participants = []
+            evidence_quotes = payload.get("evidence_quotes")
+            if not isinstance(evidence_quotes, list):
+                evidence_quotes = []
+            source_channel_id = payload.get("source_channel_id")
+            if source_channel_id is not None and not isinstance(source_channel_id, int):
+                source_channel_id = None
+            allow_post = payload.get("allow_post")
+            allow_post_bool = bool(allow_post) if isinstance(allow_post, bool) else False
+            allow_actions = payload.get("allow_actions")
+            allow_actions_bool = bool(allow_actions) if isinstance(allow_actions, bool) else False
+            handled = payload.get("handled")
+            handled_bool = bool(handled) if isinstance(handled, bool) else False
+            reply_targets = payload.get("reply_targets")
+            if not isinstance(reply_targets, list):
+                reply_targets = []
+            draft_replies = payload.get("draft_replies")
+            if not isinstance(draft_replies, list):
+                draft_replies = []
+            view_payload = IncidentViewPayload(
+                draft_message=str(payload.get("draft_message", "")),
+                reply_targets=reply_targets,
+                draft_replies=draft_replies,
+                memory_suggestions=memory_suggestions,
+                mod_role_id=mod_role_id,
+                participants=participants,
+                evidence_quotes=evidence_quotes,
+                source_channel_id=source_channel_id,
+                allow_post=allow_post_bool,
+                allow_actions=allow_actions_bool,
+                handled=handled_bool,
+            )
+            view = IncidentView(
+                payload=view_payload,
+                memory_store=self.memory_store,
+                view_store=self.view_store,
+            )
+            self.add_view(view, message_id=record.message_id)
+            restored += 1
+        if restored:
+            logger.info("Restored %s incident views", restored)
+
+
+def main() -> None:
+    load_dotenv()
+    settings = load_settings()
+    bot = IncidentBot(settings)
+    bot.run(settings.discord_token)
+
+
+if __name__ == "__main__":
+    main()

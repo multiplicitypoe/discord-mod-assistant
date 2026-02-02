@@ -1,0 +1,1 @@
+"""Incident pipeline models."""
