@@ -130,6 +130,76 @@ class IncidentBot(discord.Client):
         for line in result.draft_replies:
             line.text = self._sanitize_draft_text(line.text)
 
+        valid_user_ids: set[int] = {m.author.id for m in messages}
+        valid_message_ids: set[int] = {m.id for m in messages}
+        name_to_user_id: dict[str, int] = {}
+        for m in messages:
+            n = display_name(m.author).strip().lower()
+            if not n:
+                continue
+            # First seen wins; good enough for a local window.
+            name_to_user_id.setdefault(n, m.author.id)
+
+        # Fix or drop participants that reference unknown users.
+        fixed_participants: list[Any] = []
+        seen_uids: set[int] = set()
+        for p in result.participants:
+            uid = p.user_id
+            if uid not in valid_user_ids:
+                mapped = name_to_user_id.get((p.name or "").strip().lower())
+                if mapped is None:
+                    continue
+                uid = mapped
+            if uid in seen_uids:
+                continue
+            seen_uids.add(uid)
+            p.user_id = uid
+            fixed_participants.append(p)
+        result.participants = fixed_participants
+
+        # Drop per-user draft lines that reference unknown users.
+        if result.draft_replies:
+            result.draft_replies = [d for d in result.draft_replies if d.user_id in valid_user_ids]
+
+        # Fix or drop evidence quotes that reference unknown messages.
+        if result.evidence_quotes:
+            by_id: dict[int, discord.Message] = {m.id: m for m in messages}
+
+            def _match_quote_to_message_id(q: str) -> int | None:
+                qq = (q or "").strip().lower()
+                if not qq:
+                    return None
+                matches: list[int] = []
+                for mid, msg in by_id.items():
+                    txt = (msg.clean_content or "").strip().lower()
+                    if not txt:
+                        continue
+                    if qq in txt or txt in qq:
+                        matches.append(mid)
+                if len(matches) == 1:
+                    return matches[0]
+                return None
+
+            fixed_quotes: list[Any] = []
+            for q in result.evidence_quotes:
+                mid = q.message_id
+                if mid is not None and mid not in valid_message_ids:
+                    mid = _match_quote_to_message_id(q.quote)
+                q.message_id = mid if (mid is None or mid in valid_message_ids) else None
+                fixed_quotes.append(q)
+            result.evidence_quotes = fixed_quotes
+
+        # Drop reply targets that reference unknown users; clear invalid message_id.
+        if result.reply_targets:
+            fixed_targets: list[ReplyTarget] = []
+            for t in result.reply_targets:
+                if t.user_id not in valid_user_ids:
+                    continue
+                if t.message_id is not None and t.message_id not in valid_message_ids:
+                    t.message_id = None
+                fixed_targets.append(t)
+            result.reply_targets = fixed_targets
+
         # If the model wrote per-user drafts but forgot targets, infer targets from those.
         if not result.reply_targets and result.draft_replies:
             seen: set[int] = set()
@@ -174,12 +244,26 @@ class IncidentBot(discord.Client):
                     result.reply_targets = [ReplyTarget(user_id=uid, message_id=None) for uid in user_ids]
 
         # Ensure single-target replies have a message_id.
-        if len(result.reply_targets) == 1 and result.reply_targets[0].message_id is None:
+        if len(result.reply_targets) == 1 and (
+            result.reply_targets[0].message_id is None
+            or result.reply_targets[0].message_id not in valid_message_ids
+        ):
             uid = result.reply_targets[0].user_id
             for msg in reversed(messages):
                 if msg.author.id == uid:
                     result.reply_targets[0].message_id = msg.id
                     break
+
+        # Drop user memory suggestions that reference unknown users/messages.
+        if result.memory_suggestions and result.memory_suggestions.user_notes:
+            fixed_notes: list[Any] = []
+            for note in result.memory_suggestions.user_notes:
+                if note.user_id not in valid_user_ids:
+                    continue
+                if note.evidence_message_id is not None and note.evidence_message_id not in valid_message_ids:
+                    note.evidence_message_id = None
+                fixed_notes.append(note)
+            result.memory_suggestions.user_notes = fixed_notes
 
         # Avoid doubling the target name when we already prefix with a ping.
         if len(result.reply_targets) == 1 and result.draft_message:
@@ -278,9 +362,14 @@ class IncidentBot(discord.Client):
             exempt_raw = auto_cfg.get("exempt_suffix")
             exempt_suffix = str(exempt_raw) if isinstance(exempt_raw, str) and exempt_raw else "-news"
             cooldown_raw = auto_cfg.get("cooldown_s")
-            try:
-                cooldown_s = int(cooldown_raw) if cooldown_raw is not None else 180
-            except (TypeError, ValueError):
+            if cooldown_raw is None:
+                cooldown_s = 180
+            elif isinstance(cooldown_raw, (int, str)):
+                try:
+                    cooldown_s = int(cooldown_raw)
+                except ValueError:
+                    cooldown_s = 180
+            else:
                 cooldown_s = 180
             ignored_category_ids = set(await self.memory_store.list_auto_mod_ignored_categories(guild.id))
             routes = await self.memory_store.list_auto_mod_routes(guild.id)
@@ -1346,6 +1435,32 @@ class IncidentBot(discord.Client):
         image_meta: dict[str, dict[str, Any]] = {}
         seen_media: set[str] = set()
 
+        def _needs_high_detail(context_text: str, *, is_evidence_msg: bool) -> bool:
+            if is_evidence_msg:
+                return True
+            t = (context_text or "").lower()
+            keywords = (
+                "scam",
+                "scammer",
+                "proof",
+                "evidence",
+                "screenshot",
+                "dm",
+                "direct message",
+                "paypal",
+                "venmo",
+                "cashapp",
+                "crypto",
+                "bitcoin",
+                "wallet",
+                "gift card",
+                "nitro",
+                "steam",
+                "http://",
+                "https://",
+            )
+            return any(k in t for k in keywords)
+
         for _, msg, reply_lines in sorted(candidate_messages, key=lambda t: (t[0], t[1].created_at)):
             if len(image_payloads) >= max_media:
                 break
@@ -1360,6 +1475,13 @@ class IncidentBot(discord.Client):
             if reply_lines:
                 base_context_parts.append("replied_by=" + " | ".join(reply_lines[:2]))
             base_context = " | ".join(base_context_parts)
+
+            is_evidence_msg = msg.id in evidence_message_ids
+            needs_high = _needs_high_detail(base_context, is_evidence_msg=is_evidence_msg)
+            detail = "high" if needs_high else self.settings.openai_image_detail
+            max_dim = self.settings.openai_max_image_dim
+            if needs_high:
+                max_dim = max(max_dim, 1024)
 
             for attachment in msg.attachments:
                 if len(image_payloads) >= max_media:
@@ -1379,7 +1501,7 @@ class IncidentBot(discord.Client):
                 except Exception:
                     continue
                 resized, content_type, _, _ = resize_image_bytes(
-                    data, self.settings.openai_max_image_dim
+                    data, max_dim
                 )
                 image_id = f"m{msg.id}_att{attachment.id}"
                 image_payloads.append(
@@ -1387,6 +1509,7 @@ class IncidentBot(discord.Client):
                         "id": image_id,
                         "data_url": to_data_url(resized, content_type),
                         "context": base_context,
+                        "detail": detail,
                     }
                 )
                 image_meta[image_id] = {
@@ -1411,7 +1534,7 @@ class IncidentBot(discord.Client):
                     continue
                 try:
                     resized, content_type, _, _ = resize_image_bytes(
-                        data, self.settings.openai_max_image_dim
+                        data, max_dim
                     )
                 except Exception:
                     continue
@@ -1429,6 +1552,7 @@ class IncidentBot(discord.Client):
                         "id": image_id,
                         "data_url": to_data_url(resized, content_type),
                         "context": base_context,
+                        "detail": detail,
                     }
                 )
                 image_meta[image_id] = {
@@ -1447,7 +1571,7 @@ class IncidentBot(discord.Client):
             debug_logs=self.settings.debug_logs,
         )
 
-        # Summarize images and only continue if any are evidence or needed context.
+        # Summarize images and use notes to refine the brief.
         t0 = time.monotonic()
         summarized: list[dict[str, Any]] = []
         client = create_client(self.settings.openai_api_key)
@@ -1470,17 +1594,8 @@ class IncidentBot(discord.Client):
             time.monotonic() - t0,
         )
 
-        relevant_items: list[dict[str, Any]] = []
-        for item in summarized:
-            if not isinstance(item, dict):
-                continue
-            if bool(item.get("is_evidence", False)) or bool(item.get("is_context", False)):
-                relevant_items.append(item)
-        if not relevant_items:
-            return
-
         image_notes: list[dict[str, Any]] = []
-        for item in relevant_items:
+        for item in summarized:
             image_id = str(item.get("id") or "")
             note = str(item.get("note") or "").strip()
             if not image_id or not note:

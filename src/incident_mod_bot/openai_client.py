@@ -154,8 +154,9 @@ def summarize_images(
             "text": (
                 "For each image, write a 1-sentence note focused on what matters for moderation OR understanding the back-and-forth. "
                 "Output flags:\n"
-                "- is_evidence=true only if the image itself is likely a moderation issue (insults/harassment/slurs/threats, targeted mocking, spam/scams, doxxing/personal info, NSFW/gore).\n"
+                "- is_evidence=true if the image is likely relevant evidence for moderation action (e.g., it shows a scam attempt/spam solicitation, harassment/insults, slurs/threats, doxxing/personal info, NSFW/gore, or a screenshot/log/receipt that substantiates a report).\n"
                 "- is_context=true only if the image materially changes how to interpret nearby messages (especially reply chains), even if it is not a rule violation.\n"
+                "If the image is a screenshot shared as proof (e.g., DMs showing a scam attempt), treat it as evidence even if it is a screenshot of a conversation. Do not quote or transcribe personal info; summarize at a high level.\n"
                 "Otherwise set both false. "
                 "Return JSON only as an object: {\"images\": [{\"id\": string, \"note\": string, \"is_evidence\": boolean, \"is_context\": boolean}]}."
             ),
@@ -170,7 +171,7 @@ def summarize_images(
             {
                 "type": "input_image",
                 "image_url": payload["data_url"],
-                "detail": settings.image_detail,
+                "detail": payload.get("detail") or settings.image_detail,
             }
         )
     responses = getattr(client, "responses")
@@ -258,7 +259,8 @@ def analyze_incident(
         "Rule refs entries: {id, reason}.\n"
         "Memory suggestions: {server_notes: [str], user_notes: [{user_id, label, evidence_message_id}]}.\n"
         "Only suggest user_notes if the behavior appears more than once or is clearly habitual.\n"
-        "Use the provided user_id values.\n\n"
+        "Use the provided user_id values.\n"
+        "IDs can be long. Treat user_id and message_id as opaque identifiers and copy digits exactly from the payload; never guess or alter IDs. If you cannot provide a valid ID, use null or omit that field.\n\n"
         "Payload:\n"
         + json.dumps(payload, ensure_ascii=True)
     )
@@ -289,6 +291,7 @@ def refine_incident_with_images(
         "You already generated a JSON result from text messages. Now you have image notes from the same message window. "
         "Use them to correct the story if needed. "
         "Only mention images explicitly if they matter to moderation or the key back-and-forth. "
+        "If an image note indicates a screenshot/log offered as proof (e.g., DMs showing a scam attempt), acknowledge that in summary/signals and avoid saying 'no evidence' unless no such proof was provided. If the screenshot is not conclusive, say so plainly. "
         "Write like a competent human mod: terse, direct, no filler, no 'AI voice'. No emojis.\n"
         "Output ASCII only. No emojis or special symbols.\n\n"
         "Return JSON only with keys: summary, participants, signals, rule_refs, "
@@ -321,7 +324,8 @@ def refine_incident_with_images(
         "Reply targets: [{user_id, message_id}]. If exactly one target, set message_id to the specific message to reply to. If >1 targets, set message_id to null.\n"
         "Draft replies: [{user_id, text}] where text is what comes after the ping.\n"
         "Evidence quotes entries: {quote, message_id} where message_id is from the provided image notes or payload messages.\n"
-        "Image notes entries include: image_id, message_id, author_name, note, is_evidence, is_context.\n\n"
+        "Image notes entries include: image_id, message_id, author_name, note, is_evidence, is_context.\n"
+        "IDs can be long. Treat user_id and message_id as opaque identifiers and copy digits exactly from the base result or image notes; never guess or alter IDs. If you cannot provide a valid ID, use null or omit that field.\n\n"
         "Base result (from text):\n"
         + json.dumps(base_result, ensure_ascii=True)
         + "\n\nImage notes:\n"
