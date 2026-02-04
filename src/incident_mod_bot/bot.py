@@ -2019,11 +2019,12 @@ class IncidentBot(discord.Client):
                 await self.view_store.delete_view(record.message_id)
                 continue
             try:
-                await channel.fetch_message(record.message_id)
+                fetched_message = await channel.fetch_message(record.message_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 await self.view_store.delete_view(record.message_id)
                 continue
             payload = record.payload
+            needs_migration = payload.get("view_version") != 2
             memory_suggestions = payload.get("memory_suggestions")
             if not isinstance(memory_suggestions, dict):
                 memory_suggestions = {}
@@ -2052,6 +2053,7 @@ class IncidentBot(discord.Client):
             if not isinstance(draft_replies, list):
                 draft_replies = []
             view_payload = IncidentViewPayload(
+                view_version=2,
                 draft_message=str(payload.get("draft_message", "")),
                 reply_targets=reply_targets,
                 draft_replies=draft_replies,
@@ -2069,8 +2071,30 @@ class IncidentBot(discord.Client):
                 memory_store=self.memory_store,
                 view_store=self.view_store,
             )
-            self.add_view(view, message_id=record.message_id)
+            try:
+                self.add_view(view, message_id=record.message_id)
+            except ValueError:
+                # Non-persistent views (missing custom_id / timeout) cannot be restored.
+                await self.view_store.delete_view(record.message_id)
+                continue
             restored += 1
+
+            if needs_migration:
+                try:
+                    await fetched_message.edit(view=view)
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                    pass
+                try:
+                    migrated = ViewRecord(
+                        message_id=record.message_id,
+                        channel_id=record.channel_id,
+                        guild_id=record.guild_id,
+                        payload=view_payload.to_dict(),
+                        created_at=record.created_at,
+                    )
+                    await self.view_store.save_view(migrated)
+                except Exception:
+                    pass
         if restored:
             logger.info("Restored %s incident views", restored)
 

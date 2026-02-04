@@ -28,9 +28,12 @@ class IncidentViewPayload:
     allow_post: bool = True
     allow_actions: bool = True
     handled: bool = False
+    # Bump when component custom_id layout changes.
+    view_version: int = 2
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "view_version": self.view_version,
             "draft_message": self.draft_message,
             "reply_targets": self.reply_targets,
             "draft_replies": self.draft_replies,
@@ -64,6 +67,7 @@ class _ParticipantSelect(discord.ui.Select):
             max_values=min(len(options), 10),
             options=options,
             row=row,
+            custom_id="incident_select_participants",
         )
         # Avoid discord.py internal Item._parent attribute.
         self._incident_view = parent
@@ -93,6 +97,7 @@ class _EvidenceSelect(discord.ui.Select):
             max_values=min(len(options), 10),
             options=options,
             row=row,
+            custom_id="incident_select_evidence",
         )
         # Avoid discord.py internal Item._parent attribute.
         self._incident_view = parent
@@ -242,7 +247,7 @@ class IncidentView(discord.ui.View):
         elif not payload.draft_replies and not (
             (payload.draft_message or "").strip() and payload.reply_targets
         ):
-            self.post_public.disabled = True
+            setattr(self.post_public, "disabled", True)
         if not self.allow_actions:
             self.remove_item(self.delete_messages)
             self.remove_item(self.timeout_users)
@@ -253,7 +258,7 @@ class IncidentView(discord.ui.View):
         server_notes = suggestions.get("server_notes", []) if isinstance(suggestions, dict) else []
         user_notes = suggestions.get("user_notes", []) if isinstance(suggestions, dict) else []
         if not server_notes and not user_notes:
-            self.save_memory.disabled = True
+            setattr(self.save_memory, "disabled", True)
 
         if self.allow_actions:
             participant_options: list[discord.SelectOption] = []
@@ -285,9 +290,9 @@ class IncidentView(discord.ui.View):
                     )
                 )
             else:
-                self.timeout_users.disabled = True
-                self.kick_users.disabled = True
-                self.ban_users.disabled = True
+                setattr(self.timeout_users, "disabled", True)
+                setattr(self.kick_users, "disabled", True)
+                setattr(self.ban_users, "disabled", True)
 
             evidence_options: list[discord.SelectOption] = []
             for item in payload.evidence_quotes or []:
@@ -316,12 +321,12 @@ class IncidentView(discord.ui.View):
                     )
                 )
             else:
-                self.delete_messages.disabled = True
+                setattr(self.delete_messages, "disabled", True)
 
         if payload.handled:
             for item in self.children:
                 try:
-                    item.disabled = True  # type: ignore[attr-defined]
+                    setattr(item, "disabled", True)
                 except Exception:
                     pass
 
@@ -380,6 +385,8 @@ class IncidentView(discord.ui.View):
                 if not isinstance(item, dict):
                     continue
                 user_id = item.get("user_id")
+                if user_id is None:
+                    continue
                 try:
                     uid = int(user_id)
                 except (TypeError, ValueError):
@@ -391,6 +398,8 @@ class IncidentView(discord.ui.View):
                 if not isinstance(item, dict):
                     continue
                 user_id = item.get("user_id")
+                if user_id is None:
+                    continue
                 try:
                     uid = int(user_id)
                 except (TypeError, ValueError):
@@ -404,6 +413,8 @@ class IncidentView(discord.ui.View):
                 if not isinstance(item, dict):
                     continue
                 user_id = item.get("user_id")
+                if user_id is None:
+                    continue
                 text = str(item.get("text") or "").strip()
                 if not text:
                     continue
@@ -433,8 +444,11 @@ class IncidentView(discord.ui.View):
             for item in reply_targets:
                 if not isinstance(item, dict):
                     continue
+                raw_uid = item.get("user_id")
+                if raw_uid is None:
+                    continue
                 try:
-                    uid = int(item.get("user_id"))
+                    uid = int(raw_uid)
                 except (TypeError, ValueError):
                     continue
                 if uid != user_ids[0]:
@@ -459,12 +473,19 @@ class IncidentView(discord.ui.View):
         )
 
         try:
-            await channel.send(
-                content=content,
-                allowed_mentions=allowed_mentions,
-                reference=reference,
-                mention_author=False,
-            )
+            if reference is not None:
+                await channel.send(
+                    content=content,
+                    allowed_mentions=allowed_mentions,
+                    reference=reference,
+                    mention_author=False,
+                )
+            else:
+                await channel.send(
+                    content=content,
+                    allowed_mentions=allowed_mentions,
+                    mention_author=False,
+                )
         except discord.NotFound:
             # Likely an invalid/deleted reference message. Retry without reply.
             try:
@@ -514,11 +535,15 @@ class IncidentView(discord.ui.View):
             user_id = note.get("user_id")
             label = note.get("label")
             evidence_link = note.get("evidence_link")
-            if not user_id or not label:
+            if user_id is None or not label:
+                continue
+            try:
+                uid = int(user_id)
+            except (TypeError, ValueError):
                 continue
             await self.memory_store.add_user_observation(
                 guild.id,
-                int(user_id),
+                uid,
                 str(label),
                 str(evidence_link) if evidence_link else None,
             )
@@ -626,7 +651,7 @@ class IncidentView(discord.ui.View):
         self.payload = handled_payload
         for item in self.children:
             try:
-                item.disabled = True  # type: ignore[attr-defined]
+                setattr(item, "disabled", True)
             except Exception:
                 pass
         embed = message.embeds[0].copy() if message.embeds else None
