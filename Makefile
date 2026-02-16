@@ -1,4 +1,4 @@
-.PHONY: install run-bot lint format test build-docker run-docker ensure-data ensure-env
+.PHONY: install run-bot lint format test build-docker stop-docker run-docker docker ensure-data ensure-env
 
 DOCKER_BIN ?= docker
 DOCKER ?= $(shell \
@@ -14,6 +14,7 @@ DOCKER ?= $(shell \
 		printf '%s' "$(DOCKER_BIN)"; \
 	fi)
 IMAGE ?= discord-incident-assistant
+CONTAINER ?= discord-incident-assistant
 
 ensure-data:
 	@mkdir -p data
@@ -32,8 +33,21 @@ run-bot: ensure-env
 build-docker: ensure-data
 	$(DOCKER) build -t "$(IMAGE)" "$(CURDIR)"
 
-run-docker: build-docker ensure-env ensure-data
+stop-docker:
+	@if $(DOCKER) container inspect "$(CONTAINER)" >/dev/null 2>&1; then \
+		if [ "$$($(DOCKER) inspect -f '{{.State.Running}}' "$(CONTAINER)" 2>/dev/null)" = "true" ]; then \
+			echo "Stopping container $(CONTAINER)"; \
+			$(DOCKER) stop "$(CONTAINER)" >/dev/null; \
+		fi; \
+		echo "Removing container $(CONTAINER)"; \
+		$(DOCKER) rm "$(CONTAINER)" >/dev/null; \
+	else \
+		echo "Container $(CONTAINER) not found; nothing to stop."; \
+	fi
+
+run-docker: build-docker ensure-env ensure-data stop-docker
 	$(DOCKER) run --rm \
+		--name "$(CONTAINER)" \
 		--env-file "$(CURDIR)/.env" \
 		-v "$(CURDIR)/data:/app/data" \
 		--read-only \
@@ -45,6 +59,8 @@ run-docker: build-docker ensure-env ensure-data
 		--cpus 1.0 \
 		--user "$$(id -u):$$(id -g)" \
 		"$(IMAGE)"
+
+docker: build-docker run-docker
 
 lint:
 	poetry run ruff check src

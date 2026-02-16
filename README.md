@@ -42,21 +42,19 @@ cp .env.example .env
 2) Build and run:
 
 ```bash
-docker build -t discord-incident-assistant .
-docker run --rm --env-file .env \
-  -v "$(pwd)/data:/app/data" \
-  --read-only \
-  --tmpfs /tmp:rw,noexec,nosuid,nodev \
-  --cap-drop ALL \
-  --security-opt no-new-privileges \
-  --pids-limit 256 \
-  --memory 512m \
-  --cpus 1.0 \
-  --user "$(id -u):$(id -g)" \
-  discord-incident-assistant
+make build-docker
+make run-docker
 ```
 
-Stop with Ctrl+C.
+`make run-docker` uses a fixed container name (`discord-incident-assistant`), stops/removes an existing container with that name, then starts a fresh one. This keeps restarts idempotent (including supervisor reloads).
+
+Useful extra:
+
+```bash
+make stop-docker
+```
+
+`make run-docker` runs attached; stop with `Ctrl+C`.
 
 If you prefer Compose, `docker-compose up --build` also works (uses `docker-compose.yml`; override UID/GID if needed).
 
