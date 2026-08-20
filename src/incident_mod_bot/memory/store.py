@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import time
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import aiosqlite
 
@@ -62,6 +64,21 @@ class MemoryStore:
                 count INTEGER NOT NULL,
                 last_seen INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, user_id, label)
+            );
+
+            CREATE TABLE IF NOT EXISTS enforcement_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER,
+                brief_message_id INTEGER,
+                mod_user_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                target_user_ids TEXT NOT NULL,
+                target_message_ids TEXT NOT NULL,
+                rule_ids TEXT NOT NULL,
+                recommended TEXT NOT NULL,
+                outcome TEXT,
+                created_at INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS auto_mod_config (
@@ -299,6 +316,123 @@ class MemoryStore:
         await cursor.close()
         return [row["note"] for row in rows]
 
+    async def add_enforcement_entry(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int | None,
+        brief_message_id: int | None,
+        mod_user_id: int,
+        action: str,
+        target_user_ids: list[int],
+        target_message_ids: list[int],
+        rule_ids: list[str],
+        recommended: list[str],
+        outcome: str | None,
+    ) -> None:
+        """Record what a moderator actually did. Written automatically on button press."""
+        conn = self._require_conn()
+        await conn.execute(
+            """
+            INSERT INTO enforcement_log (
+                guild_id, channel_id, brief_message_id, mod_user_id, action,
+                target_user_ids, target_message_ids, rule_ids, recommended,
+                outcome, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id, channel_id, brief_message_id, mod_user_id, action,
+                json.dumps(list(target_user_ids)), json.dumps(list(target_message_ids)),
+                json.dumps(list(rule_ids)), json.dumps(list(recommended)),
+                outcome, int(time.time()),
+            ),
+        )
+        await conn.commit()
+
+    async def list_enforcement_entries(
+        self, guild_id: int, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            """
+            SELECT * FROM enforcement_log WHERE guild_id = ?
+            ORDER BY created_at DESC, id DESC LIMIT ?
+            """,
+            (guild_id, limit),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            for key in ("target_user_ids", "target_message_ids", "rule_ids", "recommended"):
+                try:
+                    item[key] = json.loads(item[key])
+                except (TypeError, ValueError):
+                    item[key] = []
+            out.append(item)
+        return out
+
+    async def summarize_enforcement(self, guild_id: int, *, limit: int = 200) -> list[str]:
+        """Aggregate enforcement norms for the model.
+
+        Deliberately contains no user ids or names: the model gets how this
+        server enforces its rules, never opinions about individuals.
+        """
+        entries = await self.list_enforcement_entries(guild_id, limit=limit)
+        if not entries:
+            return []
+
+        by_rule: dict[str, Counter] = defaultdict(Counter)
+        overall: Counter = Counter()
+        for e in entries:
+            overall[e["action"]] += 1
+            for rule in e["rule_ids"] or ["(unspecified)"]:
+                by_rule[rule][e["action"]] += 1
+
+        notes: list[str] = []
+        for rule, actions in sorted(by_rule.items(), key=lambda kv: -sum(kv[1].values())):
+            total = sum(actions.values())
+            if total < 2:
+                continue
+            top, count = actions.most_common(1)[0]
+            notes.append(f"{rule}: usually {top} ({count} of {total}).")
+        if not notes:
+            top, count = overall.most_common(1)[0]
+            notes.append(f"Most common moderator action: {top} ({count}).")
+        return notes[:5]
+
+    async def enforcement_stats(self, guild_id: int, *, limit: int = 500) -> dict[str, Any]:
+        """Headline counts for the /enforcement view."""
+        entries = await self.list_enforcement_entries(guild_id, limit=limit)
+        by_action: Counter = Counter(e["action"] for e in entries)
+        return {
+            "total": len(entries),
+            "by_action": dict(by_action),
+            "moderators": len({e["mod_user_id"] for e in entries}),
+            "latest": entries[0]["created_at"] if entries else None,
+        }
+
+    async def enforcement_divergence(self, guild_id: int, *, limit: int = 200) -> list[str]:
+        """Where the bot's advice and the moderators' choices disagree.
+
+        The only direct measure of whether the recommendations are any good.
+        """
+        entries = await self.list_enforcement_entries(guild_id, limit=limit)
+        gaps: Counter = Counter()
+        for e in entries:
+            advised = " ".join(e["recommended"]).lower()
+            if not advised:
+                continue
+            for verb in ("timeout", "ban", "kick", "delete", "warn"):
+                if verb in advised and verb not in e["action"].lower():
+                    gaps[verb] += 1
+        return [
+            f"Recommended '{verb}' {n} time(s) where the moderator did something else."
+            for verb, n in gaps.most_common(3)
+            if n >= 2
+        ]
+
     async def add_user_observation(
         self,
         guild_id: int,
@@ -383,3 +517,46 @@ class MemoryStore:
     def format_profile(entries: Iterable[tuple[str, int]]) -> str:
         lines = [f"- {label} (seen {count}x)" for label, count in entries]
         return "\n".join(lines)
+
+
+def format_enforcement_report(
+    *,
+    norms: list[str],
+    divergence: list[str],
+    stats: dict[str, Any],
+) -> str:
+    """Render the ledger for humans.
+
+    Deliberately aggregate: this is about rules and enforcement, never about
+    individuals, so no user ids appear here.
+    """
+    if not stats.get("total"):
+        return (
+            "**Enforcement history**\n"
+            "No enforcement history yet. It builds automatically as moderators "
+            "use the buttons on incident briefs - nothing to set up."
+        )
+
+    lines = ["**Enforcement history**", ""]
+    by_action = stats.get("by_action") or {}
+    breakdown = ", ".join(
+        f"{action} x{count}"
+        for action, count in sorted(by_action.items(), key=lambda kv: -kv[1])
+    )
+    lines.append(
+        f"{stats['total']} recorded action(s) by {stats.get('moderators', 0)} moderator(s)."
+    )
+    if breakdown:
+        lines.append(f"Breakdown: {breakdown}")
+
+    if norms:
+        lines += ["", "__How this server enforces its rules__"]
+        lines += [f"- {n}" for n in norms]
+
+    if divergence:
+        lines += ["", "__Where the bot's advice and moderators disagree__"]
+        lines += [f"- {d}" for d in divergence]
+        lines.append("")
+        lines.append("_Large gaps here usually mean the recommendations need tuning._")
+
+    return "\n".join(lines)

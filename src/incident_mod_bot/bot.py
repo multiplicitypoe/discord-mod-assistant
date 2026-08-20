@@ -16,7 +16,7 @@ from openai import AuthenticationError
 from incident_mod_bot.config import Settings, load_settings
 from incident_mod_bot.discord_ui.incident_view import IncidentView, IncidentViewPayload
 from incident_mod_bot.discord_ui.view_store import ViewRecord, ViewStore
-from incident_mod_bot.memory.store import MemoryStore
+from incident_mod_bot.memory.store import MemoryStore, format_enforcement_report
 from incident_mod_bot.openai_client import (
     OpenAISettings,
     analyze_incident,
@@ -606,6 +606,13 @@ class IncidentBot(discord.Client):
         )
         self.tree.add_command(
             app_commands.Command(
+                name="enforcement",
+                description="How this server has actually enforced its rules.",
+                callback=self._mod_enforcement,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
                 name="incident_memory_reset",
                 description="Clear server and user memory.",
                 callback=self._mod_memory_reset,
@@ -801,6 +808,32 @@ class IncidentBot(discord.Client):
             return
         formatted = "\n".join(f"- {note}" for note in notes)
         await interaction.response.send_message(formatted, ephemeral=True)
+
+    async def _mod_enforcement(self, interaction: discord.Interaction) -> None:
+        """Show the enforcement ledger: norms, activity, and where advice diverges."""
+        if not interaction.guild:
+            await interaction.response.send_message("Server-only command.", ephemeral=True)
+            return
+        self._log_cmd(interaction, "enforcement")
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if not is_mod(member, self.settings.mod_role_id):
+            await interaction.response.send_message("Mod permissions required.", ephemeral=True)
+            return
+        guild_id = interaction.guild.id
+        try:
+            stats = await self.memory_store.enforcement_stats(guild_id)
+            norms = await self.memory_store.summarize_enforcement(guild_id)
+            divergence = await self.memory_store.enforcement_divergence(guild_id)
+        except Exception:
+            logger.exception("failed to build enforcement report")
+            await interaction.response.send_message(
+                "Could not read enforcement history.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            format_enforcement_report(norms=norms, divergence=divergence, stats=stats),
+            ephemeral=True,
+        )
 
     async def _mod_memory_reset(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
@@ -1232,6 +1265,10 @@ class IncidentBot(discord.Client):
         # Text-first analysis. Images are handled in a background refinement step.
         rules_task = asyncio.create_task(self.memory_store.get_rules_memory(guild_id))
         server_task = asyncio.create_task(self.memory_store.list_server_memory(guild_id, limit=5))
+        # Earned context: how this server has actually enforced its rules.
+        # Aggregate only - never names individuals. Empty until the enforcement
+        # ledger has data, at which point this switches itself on.
+        norms_task = asyncio.create_task(self.memory_store.summarize_enforcement(guild_id))
         user_task = asyncio.create_task(self._collect_user_memory(guild_id, messages))
 
         openai_settings = OpenAISettings(
@@ -1250,6 +1287,15 @@ class IncidentBot(discord.Client):
                 rules_memory = rules_memory_raw
         server_memory = await server_task
         user_memory = await user_task
+        try:
+            enforcement_norms = await norms_task
+        except Exception:
+            logger.exception("failed to summarize enforcement history")
+            enforcement_norms = []
+        if enforcement_norms:
+            server_memory = list(server_memory) + [
+                "Observed enforcement in this server: " + " ".join(enforcement_norms)
+            ]
 
         image_ids: set[str] = set()
 
@@ -1286,6 +1332,9 @@ class IncidentBot(discord.Client):
 
         raw_result = await asyncio.create_task(_run_analysis())
         result = parse_incident_result(raw_result)
+        # Carry through how much past enforcement shaped this brief, so the
+        # ledger's contribution is visible instead of silent.
+        result.informed_by = len(enforcement_norms)
 
         self._postprocess_result(result, messages)
         self._dlog_ctx(ctx, "analyze_incident parsed in %.2fs", time.monotonic() - t0)
