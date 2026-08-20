@@ -10,3 +10,7 @@ __pycache__/
 dist/
 build/
 *.sqlite3
+
+# Core dumps. An arm64 image run on this 32 bit userland dies on SIGSYS and
+# drops one here, owned by root, which then blocks git add.
+core
