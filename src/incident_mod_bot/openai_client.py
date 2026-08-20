@@ -337,7 +337,10 @@ def refine_incident_with_images(
         input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
         temperature=0.0,
         text={"format": {"type": "json_object"}},
-        max_output_tokens=650,
+        # Must exceed analyze_incident's budget (900): this step consumes that
+        # result and returns a superset of it. At 650 it truncated mid-JSON
+        # ("Unterminated string" at ~2300 chars) and the refinement was lost.
+        max_output_tokens=1200,
     )
     _log_usage(settings, response, purpose="refine_incident_with_images")
     text = _response_text(response)
