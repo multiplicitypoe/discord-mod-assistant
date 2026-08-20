@@ -515,6 +515,8 @@ class IncidentBot(discord.Client):
             mod_role_id=mod_role_id,
             participants=action_participants,
             evidence_quotes=[q.model_dump() for q in result.evidence_quotes],
+            recommendations=list(result.recommendations or []),
+            rule_ids=[r.id for r in (result.rule_refs or [])],
             source_channel_id=channel.id,
             allow_post=True,
             allow_actions=True,
@@ -534,6 +536,23 @@ class IncidentBot(discord.Client):
             )
         except (discord.Forbidden, discord.HTTPException):
             return
+        logger.info(
+            "BRIEF posted via=%s msg=%s channel=%s headline=%r participants=%d "
+            "rules=%s recommendations=%d confidence=%.2f reply_to=%s draft=%r",
+            "automod",
+            posted.id,
+            getattr(getattr(posted, "channel", None), "id", None),
+            (getattr(result, "headline", "") or "")[:80],
+            len(result.participants or []),
+            ",".join(r.id for r in (result.rule_refs or [])) or "-",
+            len(result.recommendations or []),
+            float(getattr(result, "confidence", 0.0) or 0.0),
+            # who the draft is aimed at. The background image pass overwrites
+            # the stored view, so without this there is no record of what the
+            # moderator actually saw before refinement landed.
+            ",".join(str(getattr(t, "user_id", t)) for t in (result.reply_targets or [])) or "-",
+            (getattr(result, "draft_message", "") or "")[:100],
+        )
         record = ViewRecord(
             message_id=posted.id,
             channel_id=posted.channel.id,
@@ -1068,6 +1087,8 @@ class IncidentBot(discord.Client):
             mod_role_id=mod_role_id,
             participants=action_participants,
             evidence_quotes=[q.model_dump() for q in result.evidence_quotes],
+            recommendations=list(result.recommendations or []),
+            rule_ids=[r.id for r in (result.rule_refs or [])],
             source_channel_id=channel.id,
             allow_post=True,
             allow_actions=True,
@@ -1079,6 +1100,24 @@ class IncidentBot(discord.Client):
             view_store=self.view_store,
         )
         posted = await interaction.edit_original_response(embed=embed, view=view)
+        logger.info(
+            "BRIEF posted via=%s msg=%s channel=%s headline=%r participants=%d "
+            "rules=%s recommendations=%d confidence=%.2f reply_to=%s draft=%r",
+            "slash",
+            posted.id,
+            getattr(getattr(posted, "channel", None), "id", None),
+            (getattr(result, "headline", "") or "")[:80],
+            len(result.participants or []),
+            ",".join(r.id for r in (result.rule_refs or [])) or "-",
+            len(result.recommendations or []),
+            float(getattr(result, "confidence", 0.0) or 0.0),
+            # who the draft is aimed at. The background image pass overwrites
+            # the stored view, so without this there is no record of what the
+            # moderator actually saw before refinement landed.
+            ",".join(str(getattr(t, "user_id", t)) for t in (result.reply_targets or [])) or "-",
+            (getattr(result, "draft_message", "") or "")[:100],
+        )
+        logger.info("BRIEF generated in %.2fs", time.monotonic() - t_cmd)
         self._dlog(interaction, "Completed /mod in %.2fs", time.monotonic() - t_cmd)
 
         # Background image refinement (only updates if images are actually relevant).
@@ -1224,6 +1263,8 @@ class IncidentBot(discord.Client):
             mod_role_id=mod_role_id,
             participants=action_participants,
             evidence_quotes=[q.model_dump() for q in result.evidence_quotes],
+            recommendations=list(result.recommendations or []),
+            rule_ids=[r.id for r in (result.rule_refs or [])],
             source_channel_id=channel.id,
             allow_post=True,
             allow_actions=True,
@@ -1723,6 +1764,8 @@ class IncidentBot(discord.Client):
             mod_role_id=mod_role_id,
             participants=action_participants,
             evidence_quotes=[q.model_dump() for q in refined.evidence_quotes],
+            recommendations=list(refined.recommendations or []),
+            rule_ids=[r.id for r in (refined.rule_refs or [])],
             source_channel_id=view.payload.source_channel_id,
             allow_post=view.payload.allow_post,
             allow_actions=view.payload.allow_actions,
@@ -1979,6 +2022,17 @@ class IncidentBot(discord.Client):
         except Exception:
             return None
 
+    # Brief layout is deliberately inverted: verdict and draft reply first,
+    # audit trail last. Moderators read the synopsis and press one button, so
+    # anything they cannot act on is demoted or dropped.
+    LOW_CONFIDENCE = 0.6
+
+    @staticmethod
+    def _is_actor(p) -> bool:
+        """A participant who did something, as opposed to being in the channel."""
+        role = (p.role or "").strip().lower()
+        return bool(p.notes) or role not in {"", "member", "user", "bystander"}
+
     def _build_incident_embed(
         self,
         result: IncidentResult,
@@ -1986,61 +2040,57 @@ class IncidentBot(discord.Client):
         title: str = "Mod Brief",
         scan_label: str | None = None,
         context: str | None = None,
+        informed_by: int = 0,
     ) -> discord.Embed:
-        embed = discord.Embed(title=title, color=discord.Color.orange())
+        headline = (getattr(result, "headline", "") or "").strip()
+        embed = discord.Embed(
+            title=truncate(headline, 240) if headline else title,
+            color=discord.Color.orange(),
+        )
+
         lines: list[str] = []
         if context:
             lines.append(context)
         if scan_label:
             lines.append(scan_label)
-        lines.append(truncate(result.summary, 500))
-        embed.description = "\n".join(lines)
+        lines.append(truncate(result.summary, 400))
+        if result.recommendations:
+            do = " · ".join(r.rstrip(".") for r in result.recommendations[:3])
+            lines.append(f"**Do:** {truncate(do, 300)}")
+        if result.rule_refs:
+            lines.append("Rules: " + " · ".join(r.id for r in result.rule_refs[:3]))
+        # Make the ledger's contribution visible. Memory died last time because
+        # its payoff was invisible; silence would repeat that.
+        informed = informed_by or int(getattr(result, "informed_by", 0) or 0)
+        if informed:
+            lines.append(f"_informed by {informed} observation(s) of past enforcement_")
+        embed.description = "\n".join(line for line in lines if line)
 
-        if result.participants:
-            participants = [
-                f"{p.name}"
+        actors = [p for p in result.participants if self._is_actor(p)]
+        if actors:
+            rendered = [
+                p.name
                 + (f" ({p.role})" if p.role and p.role not in {"member", "user"} else "")
                 + (f": {p.notes}" if p.notes else "")
-                for p in result.participants[:4]
+                for p in actors[:4]
             ]
-            embed.add_field(name="Involved", value=truncate("\n".join(participants), 1024), inline=False)
-        if result.signals:
+            embed.add_field(name="Involved", value=truncate("\n".join(rendered), 1024), inline=False)
+
+        # Key Moments restates summary+evidence for simple incidents. Keep it
+        # only where the narrative earns its place: 3+ people actually involved.
+        if result.signals and len(actors) >= 3:
             embed.add_field(
                 name="Key Moments",
                 value=truncate("\n".join(f"- {s}" for s in result.signals[:4]), 1024),
                 inline=False,
             )
-        if result.rule_refs:
-            rules = [f"{r.id}: {r.reason}" for r in result.rule_refs[:2]]
-            embed.add_field(name="Rules", value=truncate("\n".join(rules), 1024), inline=False)
-        if result.recommendations:
-            embed.add_field(
-                name="Actions",
-                value=truncate("\n".join(f"- {r}" for r in result.recommendations[:3]), 1024),
-                inline=False,
-            )
-        if result.evidence_quotes:
-            quotes = [f"\"{q.quote}\" [jump]({q.link})" for q in result.evidence_quotes[:3] if q.link]
-            if quotes:
-                embed.add_field(name="Evidence", value=truncate("\n".join(quotes), 1024), inline=False)
-        if result.memory_suggestions.server_notes or result.memory_suggestions.user_notes:
-            lines: list[str] = []
-            for note in result.memory_suggestions.server_notes[:2]:
-                lines.append(f"- server: {note}")
-            for note in result.memory_suggestions.user_notes[:3]:
-                lines.append(f"- user {note.user_id}: {note.label}")
-            embed.add_field(
-                name="Memory Suggestions",
-                value=truncate("\n".join(lines), 1024),
-                inline=False,
-            )
+
         draft_lines: list[str] = []
         if result.draft_replies:
             for item in result.draft_replies[:3]:
                 text = item.text.strip()
-                if not text:
-                    continue
-                draft_lines.append(f"<@{item.user_id}> {text}".strip())
+                if text:
+                    draft_lines.append(f"<@{item.user_id}> {text}".strip())
         else:
             prefix = " ".join(f"<@{t.user_id}>" for t in result.reply_targets[:3]).strip()
             text = result.draft_message.strip()
@@ -2048,14 +2098,17 @@ class IncidentBot(discord.Client):
                 draft_lines.append(f"{prefix} {text}".strip())
             elif text:
                 draft_lines.append(text)
-
         if draft_lines:
-            embed.add_field(
-                name="Draft reply",
-                value=truncate("\n".join(draft_lines), 1024),
-                inline=False,
-            )
-        embed.set_footer(text=f"Conf: {result.confidence:.2f}")
+            embed.add_field(name="Draft reply", value=truncate("\n".join(draft_lines), 1024), inline=False)
+
+        if result.evidence_quotes:
+            quotes = [f"\"{q.quote}\" [jump]({q.link})" for q in result.evidence_quotes[:2] if q.link]
+            if quotes:
+                embed.add_field(name="Evidence", value=truncate("\n".join(quotes), 1024), inline=False)
+
+        # Confidence is only actionable as a warning; a number nobody acts on is noise.
+        if result.confidence and result.confidence < self.LOW_CONFIDENCE:
+            embed.set_footer(text="Low confidence - please verify before acting")
         return embed
 
     async def _restore_views(self) -> None:
@@ -2102,7 +2155,9 @@ class IncidentBot(discord.Client):
             if not isinstance(draft_replies, list):
                 draft_replies = []
             view_payload = IncidentViewPayload(
-                view_version=2,
+                view_version=3,
+                recommendations=list(payload.get("recommendations") or []),
+                rule_ids=list(payload.get("rule_ids") or []),
                 draft_message=str(payload.get("draft_message", "")),
                 reply_targets=reply_targets,
                 draft_replies=draft_replies,

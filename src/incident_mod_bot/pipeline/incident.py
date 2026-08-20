@@ -53,6 +53,12 @@ class MemorySuggestions(BaseModel):
 
 
 class IncidentResult(BaseModel):
+    # One-line verdict: what happened + what to do. Leads the brief, because
+    # moderators were writing this line by hand from the sections below.
+    headline: str = ""
+    # How many enforcement observations informed this brief. Rendered so the
+    # ledger's contribution is visible rather than silent.
+    informed_by: int = 0
     summary: str
     participants: list[Participant] = Field(default_factory=list)
     signals: list[str] = Field(default_factory=list)
