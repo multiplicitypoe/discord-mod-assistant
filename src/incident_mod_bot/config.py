@@ -6,6 +6,10 @@ from typing import Literal
 
 OpenAIImageDetail = Literal["low", "high", "auto"]
 
+# The bot is a member of servers it is only meant to read, so acting is limited to
+# the servers named here rather than to every server it can see.
+DEFAULT_ACTIVE_GUILD_IDS = frozenset({174993814845521922})
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -21,6 +25,13 @@ class Settings:
     mod_role_id: int | None
     debug_logs: bool
     auto_mod_default_channel_id: int | None
+    active_guild_ids: frozenset[int]
+
+    def is_active_guild(self, guild_id: int | None) -> bool:
+        """Whether the bot should act on something that happened in this server."""
+        if guild_id is None:
+            return False
+        return guild_id in self.active_guild_ids
 
 
 def _env(name: str, default: str) -> str:
@@ -46,6 +57,12 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_guild_ids(raw: str | None) -> frozenset[int]:
+    if raw is None:
+        return DEFAULT_ACTIVE_GUILD_IDS
+    return frozenset(int(part) for part in raw.split(",") if part.strip())
 
 
 def _parse_image_detail(value: str) -> OpenAIImageDetail:
@@ -81,4 +98,5 @@ def load_settings() -> Settings:
         auto_mod_default_channel_id=int(auto_mod_default_channel_value)
         if auto_mod_default_channel_value
         else None,
+        active_guild_ids=_parse_guild_ids(_env_optional("ACTIVE_GUILD_IDS")),
     )
