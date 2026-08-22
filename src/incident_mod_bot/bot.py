@@ -36,6 +36,28 @@ logger = logging.getLogger("incident_mod_bot")
 DEFAULT_AUTO_IGNORE_CATEGORY_NAMES = {"Moderation", "Logs", "Modmail", "Information"}
 
 
+def forwarded_content(message: Any) -> str:
+    """Text carried inside a forwarded message.
+
+    Discord keeps a forward's text, attachments and embeds in
+    message_snapshots and leaves the outer content empty, so anything reading
+    message.content alone sees a blank message from a user. A scam that was
+    forwarded therefore reaches the model as an empty string.
+    """
+    parts: list[str] = []
+    for snapshot in getattr(message, "message_snapshots", None) or []:
+        text = (getattr(snapshot, "content", "") or "").strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def media_carriers(message: Any) -> list[Any]:
+    """The message plus any forwarded snapshots, each of which holds its own
+    attachments, embeds and stickers."""
+    return [message] + list(getattr(message, "message_snapshots", None) or [])
+
+
 class GuildScopedCommandTree(app_commands.CommandTree):
     """Refuses commands from servers the bot is only meant to read."""
 
@@ -1532,6 +1554,23 @@ class IncidentBot(discord.Client):
                 candidate_ids.add(msg.id)
                 candidate_messages.append((2, msg, []))
 
+        # 3) Messages carrying media with little or no text. An image can be the
+        # whole violation, and nothing in its wording will say so, so it has to
+        # be able to reach the vision pass without the text pass naming it first.
+        for msg in messages:
+            if msg.id in candidate_ids:
+                continue
+            if len(compress_text(msg.clean_content, max_len=300)) > 120:
+                continue
+            if not self._extract_message_media_urls(msg) and not any(
+                self._is_image_attachment(a)
+                for carrier in media_carriers(msg)
+                for a in carrier.attachments
+            ):
+                continue
+            candidate_ids.add(msg.id)
+            candidate_messages.append((3, msg, []))
+
         # Collect up to a few media items (attachments + stickers + embed thumbnails).
         max_media = 3
         max_image_bytes = 10_000_000
@@ -1591,7 +1630,9 @@ class IncidentBot(discord.Client):
             if needs_high:
                 max_dim = max(max_dim, 1024)
 
-            for attachment in msg.attachments:
+            for attachment in [
+                a for carrier in media_carriers(msg) for a in carrier.attachments
+            ]:
                 if len(image_payloads) >= max_media:
                     break
                 if not self._is_image_attachment(attachment):
@@ -1865,7 +1906,8 @@ class IncidentBot(discord.Client):
         max_image_bytes = 10_000_000
         max_gif_bytes = 5_000_000
         for message in messages:
-            for attachment in message.attachments:
+          for carrier in media_carriers(message):
+            for attachment in carrier.attachments:
                 if not self._is_image_attachment(attachment):
                     continue
                 total_images += 1
@@ -1903,13 +1945,19 @@ class IncidentBot(discord.Client):
         compressed: list[dict[str, Any]] = []
         for message in messages:
             content = compress_text(message.clean_content, max_len=300)
+            forwarded = forwarded_content(message)
+            if forwarded:
+                content = compress_text(
+                    f"{content} [forwarded] {forwarded}".strip(), max_len=300
+                )
             image_ids: list[str] = []
-            for attachment in message.attachments:
-                if not self._is_image_attachment(attachment):
-                    continue
-                image_id = f"img_{message.id}_{attachment.id}"
-                if image_id in included_image_ids:
-                    image_ids.append(image_id)
+            for carrier in media_carriers(message):
+                for attachment in carrier.attachments:
+                    if not self._is_image_attachment(attachment):
+                        continue
+                    image_id = f"img_{message.id}_{attachment.id}"
+                    if image_id in included_image_ids:
+                        image_ids.append(image_id)
             compressed.append(
                 {
                     "id": message.id,
@@ -1984,6 +2032,12 @@ class IncidentBot(discord.Client):
     def _extract_message_media_urls(self, message: discord.Message) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
+        for carrier in media_carriers(message):
+            out.extend(self._media_urls_of(carrier, seen))
+        return out
+
+    def _media_urls_of(self, message: Any, seen: set[str]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
 
         for sticker in getattr(message, "stickers", []) or []:
             try:

@@ -519,8 +519,6 @@ class IncidentView(discord.ui.View):
             if getattr(p, "user_id", None)
         }
         participant_ids.update(int(u) for u in self.selected_user_ids)
-        if not participant_ids:
-            return []
         names = {
             int(p.user_id): (p.name or str(p.user_id))
             for p in (self.payload.participants or [])
@@ -530,7 +528,35 @@ class IncidentView(discord.ui.View):
         found: list[str] = []
         seen: set[tuple] = set()
         try:
-            async for entry in guild.audit_logs(limit=_AUDIT_SCAN_LIMIT, after=after):
+            entries = [e async for e in guild.audit_logs(limit=_AUDIT_SCAN_LIMIT, after=after)]
+
+            # Someone can be acted on without ever reaching the brief, which is
+            # exactly what happens when the bot could not read what they posted.
+            # A message of theirs being deleted from this channel is enough to
+            # bring them into scope, and then their timeout or ban counts too.
+            source_channel_id = self.payload.source_channel_id
+            for entry in entries:
+                if entry.action not in (
+                    discord.AuditLogAction.message_delete,
+                    discord.AuditLogAction.message_bulk_delete,
+                ):
+                    continue
+                where = getattr(getattr(entry, "extra", None), "channel", None)
+                where_id = getattr(where, "id", where)
+                if not source_channel_id or not where_id:
+                    continue
+                if int(where_id) != int(source_channel_id):
+                    continue
+                raw = getattr(getattr(entry, "target", None), "id", None)
+                try:
+                    participant_ids.add(int(raw))
+                except (TypeError, ValueError):
+                    continue
+
+            if not participant_ids:
+                return []
+
+            for entry in entries:
                 # Not every audit target is a user. Invite entries carry a code
                 # such as 'AyewUQ6G' as their id, and an unguarded int() there
                 # aborted the whole scan, so the summary silently came back
@@ -547,7 +573,14 @@ class IncidentView(discord.ui.View):
                     or getattr(entry.user, "name", None)
                     or "unknown"
                 )
-                subject = names.get(target_id, str(target_id))
+                # Someone pulled in from the audit log alone has no entry in the
+                # brief, so take whatever name the log itself carries.
+                target_obj = getattr(entry, "target", None)
+                subject = names.get(target_id) or (
+                    getattr(target_obj, "display_name", None)
+                    or getattr(target_obj, "name", None)
+                    or str(target_id)
+                )
                 action = entry.action
                 line = None
                 if action is discord.AuditLogAction.member_update:
