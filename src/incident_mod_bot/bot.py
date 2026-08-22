@@ -36,6 +36,22 @@ logger = logging.getLogger("incident_mod_bot")
 DEFAULT_AUTO_IGNORE_CATEGORY_NAMES = {"Moderation", "Logs", "Modmail", "Information"}
 
 
+class GuildScopedCommandTree(app_commands.CommandTree):
+    """Refuses commands from servers the bot is only meant to read."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        settings = getattr(interaction.client, "settings", None)
+        guild_id = interaction.guild.id if interaction.guild else None
+        if settings is not None and not settings.is_active_guild(guild_id):
+            logger.info("Ignoring command from an inactive guild guild_id=%s", guild_id)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "This bot does not run commands in this server.", ephemeral=True
+                )
+            return False
+        return True
+
+
 class IncidentBot(discord.Client):
     def __init__(self, settings: Settings) -> None:
         intents = discord.Intents.default()
@@ -43,7 +59,7 @@ class IncidentBot(discord.Client):
         intents.guilds = True
         super().__init__(intents=intents)
         self.settings = settings
-        self.tree = app_commands.CommandTree(self)
+        self.tree = GuildScopedCommandTree(self)
         self.memory_store = MemoryStore(settings.db_path)
         self.view_store = ViewStore(settings.db_path)
         self.openai = create_client(settings.openai_api_key)
@@ -310,6 +326,8 @@ class IncidentBot(discord.Client):
         if message.author.bot:
             return
         if not message.guild:
+            return
+        if not self.settings.is_active_guild(message.guild.id):
             return
         if not message.role_mentions:
             return
