@@ -2120,16 +2120,23 @@ class IncidentBot(discord.Client):
             color=discord.Color.orange(),
         )
 
+        # What happened comes first and the action second, with a blank line
+        # between them. Reading them as one paragraph made the description look
+        # like a continuation of the instruction.
         lines: list[str] = []
-        if result.recommendations:
-            do = " · ".join(r.rstrip(".") for r in result.recommendations[:3])
-            lines.append(f"**Do:** {truncate(do, 300)}")
         lines.append(truncate(result.summary, 400))
-        if result.rule_refs:
-            lines.append("Rules: " + " · ".join(r.id for r in result.rule_refs[:3]))
         if context:
             lines.append(context)
-        embed.description = "\n".join(line for line in lines if line)
+        do_lines: list[str] = []
+        if result.recommendations:
+            do = " · ".join(r.rstrip(".") for r in result.recommendations[:3])
+            do_lines.append(f"**Do:** {truncate(do, 300)}")
+        if result.rule_refs:
+            do_lines.append("Rules: " + " · ".join(r.id for r in result.rule_refs[:3]))
+        body = "\n".join(line for line in lines if line)
+        if do_lines:
+            body += "\n\n" + "\n".join(do_lines)
+        embed.description = body
 
         actors = [p for p in result.participants if self._is_actor(p)]
         if actors:
