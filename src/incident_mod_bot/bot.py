@@ -2135,7 +2135,7 @@ class IncidentBot(discord.Client):
         # A fixed label, so every card has the same thing in the same place and
         # it pairs with **Do:** below. "What happened" is what moderators write
         # in chat-discussion; "incident" and "flashpoint" are not.
-        lines.append(f"**What happened:** {truncate(result.summary, 400)}")
+        lines.append(f"**What:** {truncate(result.summary, 400)}")
         do_lines: list[str] = []
         if result.recommendations:
             do = " · ".join(r.rstrip(".") for r in result.recommendations[:3])
