@@ -27,7 +27,7 @@ _AUDIT_MAX_LINES = 8
 # between looks, giving up after the last one.
 _AUDIT_FOLLOW_UP_S = (30, 120, 300, 900)
 
-_ACTION_FIELD = "Action taken"
+_ACTION_FIELD = "Action taken:"
 
 # Background work has to be held onto. The event loop keeps only weak
 # references to tasks, so one whose only reference is a local variable can be
