@@ -459,10 +459,9 @@ class IncidentView(discord.ui.View):
                 if wait_s:
                     await asyncio.sleep(wait_s)
                 lines = await self._collect_recent_mod_actions(interaction, since=since)
-                fresh_lines = [line for line in lines if line not in shown]
-                if not fresh_lines:
+                if not lines or lines == shown:
                     continue
-                shown.extend(fresh_lines)
+                shown = lines
                 await self._show_action_summary(message, shown)
                 logger.info("Action summary for brief %s: %s", brief, "; ".join(shown))
                 if self.memory_store is not None:
@@ -616,7 +615,7 @@ class IncidentView(discord.ui.View):
                 if key in seen:
                     continue
                 seen.add(key)
-                found.append(f"{line} \u00b7 by {who}")
+                found.append((who, line))
                 if len(found) >= _AUDIT_MAX_LINES:
                     break
         except discord.Forbidden:
@@ -625,7 +624,16 @@ class IncidentView(discord.ui.View):
         except Exception:
             logger.exception("Failed to read audit log for action summary")
             return []
-        return found
+        by_actor: dict[str, list[str]] = {}
+        for who, line in found:
+            by_actor.setdefault(who, []).append(line)
+        out: list[str] = []
+        for who, lines in by_actor.items():
+            # They read as one sentence once grouped, so only the first stays
+            # capitalised: "Rowan: timed out X for 24 hours, deleted a message".
+            parts = [(ln[:1].lower() + ln[1:]) if ln else ln for ln in lines]
+            out.append(f"{who}: " + ", ".join(parts))
+        return out
 
     async def _log_enforcement(
         self,
@@ -895,7 +903,7 @@ class IncidentView(discord.ui.View):
         await interaction.response.send_message(f"Saved {saved} memory note(s).", ephemeral=True)
 
     @discord.ui.button(
-        label="Delete Message(s)",
+        label="Delete Messages",
         style=discord.ButtonStyle.danger,
         custom_id="incident_delete_messages",
         row=3,
@@ -1049,7 +1057,7 @@ class IncidentView(discord.ui.View):
                f"action summary for brief {message.id}")
 
     @discord.ui.button(
-        label="Timeout User(s)",
+        label="Timeout Users",
         style=discord.ButtonStyle.secondary,
         custom_id="incident_timeout_users",
         row=3,
@@ -1074,7 +1082,7 @@ class IncidentView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Kick User(s)",
+        label="Kick Users",
         style=discord.ButtonStyle.danger,
         custom_id="incident_kick_users",
         row=3,
@@ -1128,7 +1136,7 @@ class IncidentView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Ban User(s)",
+        label="Ban Users",
         style=discord.ButtonStyle.danger,
         custom_id="incident_ban_users",
         row=3,
