@@ -2128,7 +2128,7 @@ class IncidentBot(discord.Client):
         if result.rule_refs:
             lines.append("Rules: " + " · ".join(r.id for r in result.rule_refs[:3]))
         if context:
-            lines.append(f"-# {context}")
+            lines.append(context)
         embed.description = "\n".join(line for line in lines if line)
 
         actors = [p for p in result.participants if self._is_actor(p)]
