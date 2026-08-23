@@ -494,7 +494,7 @@ class IncidentBot(discord.Client):
 
         now = discord.utils.utcnow()
         oldest = messages[0].created_at
-        scan_label = f"{len(messages)} msgs | {human_timedelta(now - oldest)} ago -> now"
+        scan_label = f"last {human_timedelta(now - oldest)}"
 
         role_names = ", ".join(f"@{r.name}" for r in message.role_mentions)
         ctx = (
@@ -519,7 +519,7 @@ class IncidentBot(discord.Client):
 
         ping_author = display_name(message.author)
         context = (
-            f"Trigger: {ping_author} pinged {role_names} in {source_parent.mention} "
+            f"{ping_author} pinged {role_names} in {source_parent.mention} "
             f"([jump]({message.jump_url}))"
         )
         embed = self._build_incident_embed(
@@ -1073,7 +1073,7 @@ class IncidentBot(discord.Client):
 
         now = discord.utils.utcnow()
         oldest = messages[0].created_at
-        scan_label = f"{len(messages)} msgs | {human_timedelta(now - oldest)} ago -> now"
+        scan_label = f"last {human_timedelta(now - oldest)}"
         try:
             result, raw_result = await self._analyze_incident_messages(
                 guild_id=interaction.guild.id,
@@ -2121,21 +2121,15 @@ class IncidentBot(discord.Client):
         )
 
         lines: list[str] = []
-        if context:
-            lines.append(context)
-        if scan_label:
-            lines.append(scan_label)
-        lines.append(truncate(result.summary, 400))
         if result.recommendations:
             do = " · ".join(r.rstrip(".") for r in result.recommendations[:3])
             lines.append(f"**Do:** {truncate(do, 300)}")
+        lines.append(truncate(result.summary, 400))
         if result.rule_refs:
             lines.append("Rules: " + " · ".join(r.id for r in result.rule_refs[:3]))
-        # Make the ledger's contribution visible. Memory died last time because
-        # its payoff was invisible; silence would repeat that.
-        informed = informed_by or int(getattr(result, "informed_by", 0) or 0)
-        if informed:
-            lines.append(f"_informed by {informed} observation(s) of past enforcement_")
+        tail = " · ".join(part for part in (context, scan_label) if part)
+        if tail:
+            lines.append(f"-# {tail}")
         embed.description = "\n".join(line for line in lines if line)
 
         actors = [p for p in result.participants if self._is_actor(p)]
@@ -2152,7 +2146,7 @@ class IncidentBot(discord.Client):
         # only where the narrative earns its place: 3+ people actually involved.
         if result.signals and len(actors) >= 3:
             embed.add_field(
-                name="Key Moments",
+                name="What happened",
                 value=truncate("\n".join(f"- {s}" for s in result.signals[:4]), 1024),
                 inline=False,
             )
