@@ -521,8 +521,8 @@ class IncidentBot(discord.Client):
         # The verb carries the link. A trailing "(jump)" is a second thing to read
         # for the same destination.
         context = (
-            f"{ping_author} [pinged]({message.jump_url}) {role_names} "
-            f"in {source_parent.mention}"
+            f"{ping_author} pinged {role_names} in #{source_parent.name}",
+            message.jump_url,
         )
         embed = self._build_incident_embed(
             result,
@@ -1247,7 +1247,7 @@ class IncidentBot(discord.Client):
         before_count = max(len(before_messages) - 1, 0)
         after_count = len(after_messages)
         scan_label = f"{before_count} before + {after_count} after | {human_timedelta(latest - oldest)} span"
-        context = f"Anchor: [jump]({message.jump_url}) in {channel.mention}"
+        context = (f"Message flagged in #{channel.name}", message.jump_url)
 
         try:
             result, raw_result = await self._analyze_incident_messages(
@@ -1475,7 +1475,7 @@ class IncidentBot(discord.Client):
         messages: list[discord.Message],
         scan_label: str,
         title: str,
-        context: str | None,
+        context: tuple[str, str | None] | None,
         action_participants: list[dict[str, Any]],
         mod_role_id: int | None,
         persist_view: bool,
@@ -2113,12 +2113,18 @@ class IncidentBot(discord.Client):
         *,
         title: str = "Mod Brief",
         scan_label: str | None = None,
-        context: str | None = None,
+        context: tuple[str, str | None] | None = None,
         informed_by: int = 0,
     ) -> discord.Embed:
         headline = (getattr(result, "headline", "") or "").strip()
+        # The title is the slot people skim past, so it carries what raised the
+        # brief rather than its content. Giving the embed a url makes the whole
+        # title a blue link, which is the only way to get a visible link up
+        # there: titles render no markdown and no mentions.
+        context_text, context_url = context if context else (None, None)
         embed = discord.Embed(
-            title=truncate(headline, 240) if headline else title,
+            title=truncate(context_text or headline or title, 240),
+            url=context_url or None,
             color=discord.Color.orange(),
         )
 
@@ -2127,8 +2133,6 @@ class IncidentBot(discord.Client):
         # like a continuation of the instruction.
         lines: list[str] = []
         lines.append(truncate(result.summary, 400))
-        if context:
-            lines.append(context)
         do_lines: list[str] = []
         if result.recommendations:
             do = " · ".join(r.rstrip(".") for r in result.recommendations[:3])
