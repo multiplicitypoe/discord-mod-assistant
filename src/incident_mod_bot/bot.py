@@ -518,9 +518,11 @@ class IncidentBot(discord.Client):
             return
 
         ping_author = display_name(message.author)
+        # The verb carries the link. A trailing "(jump)" is a second thing to read
+        # for the same destination.
         context = (
-            f"{ping_author} pinged {role_names} in {source_parent.mention} "
-            f"([jump]({message.jump_url}))"
+            f"{ping_author} [pinged]({message.jump_url}) {role_names} "
+            f"in {source_parent.mention}"
         )
         embed = self._build_incident_embed(
             result,
