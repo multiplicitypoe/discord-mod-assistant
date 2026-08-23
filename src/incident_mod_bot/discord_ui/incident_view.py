@@ -615,7 +615,7 @@ class IncidentView(discord.ui.View):
                 if key in seen:
                     continue
                 seen.add(key)
-                found.append((who, line, subject))
+                found.append(f"{line} \u00b7 by {who}")
                 if len(found) >= _AUDIT_MAX_LINES:
                     break
         except discord.Forbidden:
@@ -624,24 +624,7 @@ class IncidentView(discord.ui.View):
         except Exception:
             logger.exception("Failed to read audit log for action summary")
             return []
-        by_actor: dict[str, list[str]] = {}
-        subjects_by_actor: dict[str, list[str]] = {}
-        for who, line, subject in found:
-            by_actor.setdefault(who, []).append(line)
-            subjects_by_actor.setdefault(who, []).append(subject)
-        out: list[str] = []
-        for who, lines in by_actor.items():
-            # They read as one sentence once grouped, so only the first stays
-            # capitalised: "Rowan: timed out X for 24 hours, deleted a message".
-            parts = [(ln[:1].lower() + ln[1:]) if ln else ln for ln in lines]
-            # One moderator acting twice on one person should not print that
-            # person twice. Only collapse when every action shares one target,
-            # so acting on two people still names both.
-            subjects = subjects_by_actor.get(who, [])
-            if len(parts) > 1 and len(set(subjects)) == 1 and subjects[0]:
-                parts = [parts[0]] + [p.replace(subjects[0], "them") for p in parts[1:]]
-            out.append(f"{who}: " + ", ".join(parts))
-        return out
+        return found
 
     async def _log_enforcement(
         self,
