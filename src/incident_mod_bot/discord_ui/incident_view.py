@@ -1021,6 +1021,12 @@ class IncidentView(discord.ui.View):
         embed = message.embeds[0].copy() if message.embeds else None
         if embed is not None:
             embed.color = discord.Color.green()
+            # Nobody uses it once a mod has actually replied or moved on; it's
+            # dead weight on a resolved card.
+            for index, existing in enumerate(embed.fields):
+                if existing.name == "Draft reply":
+                    embed.remove_field(index)
+                    break
             footer = embed.footer.text or ""
             who = interaction.user
             who_name = who.display_name if isinstance(who, discord.Member) else str(who)
