@@ -99,10 +99,11 @@ def test_bystanders_are_not_listed_as_involved(bot):
     assert "bystander1" not in involved and "bystander2" not in involved
 
 
-def test_rules_are_tags_in_the_header_not_a_section(bot):
+def test_rules_are_internal_only_never_shown_on_the_card(bot):
+    """Rule ids inform the model, they don't belong in front of a moderator."""
     embed = bot._build_incident_embed(rmt_incident())
     assert "Rules" not in field_names(embed)
-    assert "spam" in embed.description and "notrading" in embed.description
+    assert "spam" not in embed.description and "notrading" not in embed.description
 
 
 def test_high_confidence_is_not_shown(bot):
