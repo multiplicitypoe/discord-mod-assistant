@@ -2133,13 +2133,15 @@ class IncidentBot(discord.Client):
         # like a continuation of the instruction.
         lines: list[str] = []
         # A fixed label, so every card has the same thing in the same place and
-        # it pairs with **Do:** below. "What happened" is what moderators write
-        # in chat-discussion; "incident" and "flashpoint" are not.
-        lines.append(f"**What:** {truncate(result.summary, 400)}")
+        # it pairs with **Do**: below. "What happened" is what moderators write
+        # in chat-discussion; "incident" and "flashpoint" are not. Label and
+        # content sit on separate lines, matching how Evidence and Draft reply
+        # read as fields.
+        lines.append(f"**What**:\n{truncate(result.summary, 400)}")
         do_lines: list[str] = []
         if result.recommendations:
             do = " · ".join(r.rstrip(".") for r in result.recommendations[:3])
-            do_lines.append(f"**Do:** {truncate(do, 300)}")
+            do_lines.append(f"**Do**:\n{truncate(do, 300)}")
         if result.rule_refs:
             do_lines.append("Rules: " + " · ".join(r.id for r in result.rule_refs[:3]))
         body = "\n".join(line for line in lines if line)
