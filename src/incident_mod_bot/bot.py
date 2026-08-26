@@ -503,7 +503,7 @@ class IncidentBot(discord.Client):
             f"user={message.author.id}({display_name(message.author)!r})"
         )
         try:
-            result, raw_result = await self._analyze_incident_messages(
+            result, raw_result, analysis_payload = await self._analyze_incident_messages(
                 guild_id=guild.id,
                 messages=messages,
                 mod_role_id=mod_role_id,
@@ -603,6 +603,12 @@ class IncidentBot(discord.Client):
             created_at=time.time(),
         )
         await self.view_store.save_view(record)
+        try:
+            await self.memory_store.save_incident_payload(
+                posted.id, guild.id, {**analysis_payload, "source_channel_id": channel.id}
+            )
+        except Exception:
+            logger.exception("Failed to persist incident payload for replay")
 
         asyncio.create_task(
             self._maybe_update_brief_with_images(
@@ -1077,7 +1083,7 @@ class IncidentBot(discord.Client):
         oldest = messages[0].created_at
         scan_label = f"last {human_timedelta(now - oldest)}"
         try:
-            result, raw_result = await self._analyze_incident_messages(
+            result, raw_result, analysis_payload = await self._analyze_incident_messages(
                 guild_id=interaction.guild.id,
                 messages=messages,
                 mod_role_id=mod_role_id,
@@ -1159,6 +1165,14 @@ class IncidentBot(discord.Client):
             ",".join(str(getattr(t, "user_id", t)) for t in (result.reply_targets or [])) or "-",
             (getattr(result, "draft_message", "") or "")[:100],
         )
+        try:
+            await self.memory_store.save_incident_payload(
+                posted.id,
+                interaction.guild.id,
+                {**analysis_payload, "source_channel_id": channel.id},
+            )
+        except Exception:
+            logger.exception("Failed to persist incident payload for replay")
         logger.info("BRIEF generated in %.2fs", time.monotonic() - t_cmd)
         self._dlog(interaction, "Completed /mod in %.2fs", time.monotonic() - t_cmd)
 
@@ -1250,7 +1264,7 @@ class IncidentBot(discord.Client):
         context = (f"Message flagged in #{channel.name}", message.jump_url)
 
         try:
-            result, raw_result = await self._analyze_incident_messages(
+            result, raw_result, analysis_payload = await self._analyze_incident_messages(
                 guild_id=interaction.guild.id,
                 messages=window,
                 mod_role_id=mod_role_id,
@@ -1318,6 +1332,14 @@ class IncidentBot(discord.Client):
             view_store=self.view_store,
         )
         posted = await interaction.edit_original_response(embed=embed, view=view)
+        try:
+            await self.memory_store.save_incident_payload(
+                posted.id,
+                interaction.guild.id,
+                {**analysis_payload, "source_channel_id": channel.id},
+            )
+        except Exception:
+            logger.exception("Failed to persist incident payload for replay")
 
         asyncio.create_task(
             self._maybe_update_brief_with_images(
@@ -1344,7 +1366,7 @@ class IncidentBot(discord.Client):
         mod_role_id: int | None,
         anchor_message_id: int | None = None,
         ctx: str,
-    ) -> tuple[IncidentResult, dict[str, Any]]:
+    ) -> tuple[IncidentResult, dict[str, Any], dict[str, Any]]:
         # Text-first analysis. Images are handled in a background refinement step.
         rules_task = asyncio.create_task(self.memory_store.get_rules_memory(guild_id))
         server_task = asyncio.create_task(self.memory_store.list_server_memory(guild_id, limit=5))
@@ -1447,7 +1469,7 @@ class IncidentBot(discord.Client):
             len(result.memory_suggestions.server_notes),
             len(result.memory_suggestions.user_notes),
         )
-        return result, raw_result
+        return result, raw_result, payload
 
     @staticmethod
     def _incident_signature(result: IncidentResult) -> tuple[object, ...]:
