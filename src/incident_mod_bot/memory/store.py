@@ -102,9 +102,54 @@ class MemoryStore:
                 category_id INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, category_id)
             );
+
+            CREATE TABLE IF NOT EXISTS incident_payloads (
+                brief_message_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
             """
         )
         await conn.commit()
+
+    async def save_incident_payload(
+        self, brief_message_id: int, guild_id: int, payload: dict[str, Any]
+    ) -> None:
+        """Snapshot of what analyze_incident actually saw, for replay.py.
+
+        Channel history is not a durable record - the messages a brief was
+        built from are often gone by the time anyone wants to re-check the
+        wording, because deleting them is usually the enforcement action
+        itself. This is the payload, not the result: replaying it re-runs the
+        real prompt instead of re-describing what it produced.
+        """
+        conn = self._require_conn()
+        await conn.execute(
+            """
+            INSERT INTO incident_payloads (brief_message_id, guild_id, payload_json, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(brief_message_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                created_at = excluded.created_at
+            """,
+            (brief_message_id, guild_id, json.dumps(payload, ensure_ascii=True), int(time.time())),
+        )
+        await conn.commit()
+
+    async def get_incident_payload(self, brief_message_id: int) -> tuple[int, dict[str, Any]] | None:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT guild_id, payload_json FROM incident_payloads WHERE brief_message_id = ?",
+            (brief_message_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        try:
+            return int(row["guild_id"]), json.loads(row["payload_json"])
+        except json.JSONDecodeError:
+            return None
 
     async def get_auto_mod_config(self, guild_id: int) -> dict[str, object]:
         conn = self._require_conn()
