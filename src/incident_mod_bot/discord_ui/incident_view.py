@@ -513,16 +513,26 @@ class IncidentView(discord.ui.View):
         guild = getattr(interaction, "guild", None)
         if guild is None:
             return []
-        participant_ids = {
-            int(p.user_id) for p in (self.payload.participants or [])
-            if getattr(p, "user_id", None)
-        }
+        # payload.participants is the persisted view payload, plain dicts (see
+        # the participant select above), not the pydantic Participant objects
+        # result.participants holds. Attribute access here silently matched
+        # nothing, so every audit log lookup ran against an empty id set
+        # unless a moderator had used the participant dropdown themselves.
+        participant_ids: set[int] = set()
+        names: dict[int, str] = {}
+        for p in self.payload.participants or []:
+            if not isinstance(p, dict):
+                continue
+            raw_id = p.get("user_id")
+            if raw_id is None:
+                continue
+            try:
+                pid = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            participant_ids.add(pid)
+            names[pid] = str(p.get("name") or pid)
         participant_ids.update(int(u) for u in self.selected_user_ids)
-        names = {
-            int(p.user_id): (p.name or str(p.user_id))
-            for p in (self.payload.participants or [])
-            if getattr(p, "user_id", None)
-        }
         after = since or (datetime.now(timezone.utc) - timedelta(seconds=_AUDIT_LOOKBACK_S))
         found: list[str] = []
         seen: set[tuple] = set()
