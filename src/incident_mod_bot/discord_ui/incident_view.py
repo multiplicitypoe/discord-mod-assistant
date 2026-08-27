@@ -691,9 +691,15 @@ class IncidentView(discord.ui.View):
         """A moderator answering in the channel, when there's nothing to
         enforce and so nothing in the audit log.
 
-        "Relevant" means an actual Discord reply to the brief's own ping or
-        evidence, not just a moderator being active in the channel afterward
-        - in a busy channel that would be almost every message.
+        A message only earns a first look by being an actual Discord reply to
+        the brief's own ping or evidence - not just a moderator being active
+        in the channel afterward, which in a busy channel would be almost
+        every message. But a moderator who has replied once is now part of
+        the incident's own conversation, and real answers routinely spill
+        into a second message ("do you think I should forward the GGG
+        member's message?") that isn't itself a reply to anything. Once a
+        moderator clears the reply bar, their later messages in the same
+        window count too.
         """
         guild = getattr(interaction, "guild", None)
         source_channel_id = self.payload.source_channel_id
@@ -715,39 +721,61 @@ class IncidentView(discord.ui.View):
             return []
 
         after = since or (datetime.now(timezone.utc) - timedelta(seconds=_AUDIT_LOOKBACK_S))
+
+        def _is_mod_author(msg: Any) -> bool:
+            try:
+                return not getattr(msg.author, "bot", False) and is_mod(
+                    msg.author, self.payload.mod_role_id
+                )
+            except AttributeError:
+                # A guild channel's history hands back Member objects, not
+                # bare Users, so this has roles and guild_permissions to
+                # check - but one odd author must never abort the whole scan.
+                return False
+
+        def _line(msg: Any, *, is_reply: bool) -> str:
+            who = (
+                getattr(msg.author, "display_name", None)
+                or getattr(msg.author, "name", None)
+                or "unknown"
+            )
+            content = _truncate_one_line(msg.clean_content, 140)
+            verb = "Replied in channel" if is_reply else "Also in channel"
+            return f'{verb}: "{content}" · by {who}'
+
         found: list[str] = []
         seen: set[int] = set()
         try:
             client = getattr(interaction, "client", None)
             channel = await client.fetch_channel(source_channel_id)
-            async for msg in channel.history(after=after, limit=_AUDIT_SCAN_LIMIT):
-                if msg.id in seen:
-                    continue
+            messages = [
+                m async for m in channel.history(after=after, limit=_AUDIT_SCAN_LIMIT)
+            ]
+            messages.sort(key=lambda m: m.id)
+
+            engaged_mod_ids: set[int] = set()
+            for msg in messages:
                 ref = getattr(msg, "reference", None)
-                ref_id = getattr(ref, "message_id", None)
-                if ref_id not in relevant_ids:
+                if getattr(ref, "message_id", None) not in relevant_ids:
                     continue
-                # A guild channel's history hands back Member objects, not
-                # bare Users, so this has roles and guild_permissions to check
-                # - but never trust that hard enough to let one odd message
-                # abort the whole scan.
-                try:
-                    if getattr(msg.author, "bot", False) or not is_mod(
-                        msg.author, self.payload.mod_role_id
-                    ):
-                        continue
-                except AttributeError:
+                if not _is_mod_author(msg):
                     continue
                 seen.add(msg.id)
-                who = (
-                    getattr(msg.author, "display_name", None)
-                    or getattr(msg.author, "name", None)
-                    or "unknown"
-                )
-                content = _truncate_one_line(msg.clean_content, 140)
-                found.append(f'Replied in channel: "{content}" · by {who}')
+                engaged_mod_ids.add(msg.author.id)
+                found.append(_line(msg, is_reply=True))
                 if len(found) >= _AUDIT_MAX_LINES:
-                    break
+                    return found
+
+            if engaged_mod_ids:
+                for msg in messages:
+                    if msg.id in seen or msg.author.id not in engaged_mod_ids:
+                        continue
+                    if not _is_mod_author(msg):
+                        continue
+                    seen.add(msg.id)
+                    found.append(_line(msg, is_reply=False))
+                    if len(found) >= _AUDIT_MAX_LINES:
+                        break
         except discord.Forbidden:
             return []
         except Exception:

@@ -39,8 +39,8 @@ class FakeModAuthor:
     """A message author with the mod role - what channel.history() actually
     hands back for a guild message, per discord.py's own Member resolution."""
 
-    def __init__(self, name, *, is_mod=True, is_bot=False):
-        self.id = 266697128234057728
+    def __init__(self, name, *, is_mod=True, is_bot=False, id_=266697128234057728):
+        self.id = id_
         self.name = name
         self.display_name = name
         self.bot = is_bot
@@ -132,6 +132,61 @@ async def test_a_moderators_reply_to_the_ping_is_the_action_summary():
     assert found, "the moderator's reply to the ping was not picked up"
     assert "bidoblob" in found[0]
     assert "honestly I don't know" in found[0]
+
+
+async def test_a_follow_up_from_the_same_moderator_also_counts():
+    """The real second half of the same incident: bidoblob's actual answer
+    was a reply, but the more substantial message - asking whether to
+    forward a GGG member's message - was a plain follow-up two minutes
+    later, no reply reference at all. Missing this was the whole complaint:
+    a moderator clearing the reply bar makes their next messages part of
+    the incident's own conversation, not just channel noise."""
+    anchor_id = 1542361005378764881
+    reply = FakeChannelMessage(
+        1542361152871338154,
+        FakeModAuthor("bidoblob"),
+        "honestly I don't know",
+        reference=FakeReference(anchor_id),
+    )
+    follow_up = FakeChannelMessage(
+        1542361641478258728,
+        FakeModAuthor("bidoblob"),
+        "do you guys think I should forward the GGG member's message?",
+    )
+    view = _view(anchor_id)
+    interaction = FakeInteraction(FakeGuild(), FakeClient(FakeChannel([reply, follow_up])))
+
+    found = await view._collect_recent_mod_channel_replies(interaction)
+
+    assert len(found) == 2, "the follow-up should ride along with the reply that earned it"
+    assert "honestly I don't know" in found[0], "the reply should lead, the follow-up second"
+    assert "forward the GGG member's message" in found[1]
+    assert "bidoblob" in found[1]
+
+
+async def test_a_follow_up_from_an_uninvolved_moderator_does_not_count():
+    """Clearing the reply bar has to be per moderator, not global - a
+    different moderator chatting nearby is exactly the noise case this is
+    meant to exclude."""
+    anchor_id = 1542361005378764881
+    reply = FakeChannelMessage(
+        1,
+        FakeModAuthor("bidoblob"),
+        "honestly I don't know",
+        reference=FakeReference(anchor_id),
+    )
+    unrelated = FakeChannelMessage(
+        2,
+        FakeModAuthor("Talisen", id_=999999999999999999),
+        "unrelated chat, no reference, different mod",
+    )
+    view = _view(anchor_id)
+    interaction = FakeInteraction(FakeGuild(), FakeClient(FakeChannel([reply, unrelated])))
+
+    found = await view._collect_recent_mod_channel_replies(interaction)
+
+    assert len(found) == 1
+    assert "bidoblob" in found[0]
 
 
 async def test_a_reply_from_a_non_moderator_does_not_count():
