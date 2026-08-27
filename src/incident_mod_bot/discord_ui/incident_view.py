@@ -459,6 +459,13 @@ class IncidentView(discord.ui.View):
                 if wait_s:
                     await asyncio.sleep(wait_s)
                 lines = await self._collect_recent_mod_actions(interaction, since=since)
+                if not lines:
+                    # No audit-log action doesn't mean nothing happened - often
+                    # a moderator just answered in the channel. Only checked as
+                    # a fallback: a real action already tells the fuller story.
+                    lines = await self._collect_recent_mod_channel_replies(
+                        interaction, since=since
+                    )
                 if not lines or lines == shown:
                     continue
                 shown = lines
@@ -633,6 +640,76 @@ class IncidentView(discord.ui.View):
             return []
         except Exception:
             logger.exception("Failed to read audit log for action summary")
+            return []
+        return found
+
+    async def _collect_recent_mod_channel_replies(
+        self, interaction: Any, since: datetime | None = None
+    ) -> list[str]:
+        """A moderator answering in the channel, when there's nothing to
+        enforce and so nothing in the audit log.
+
+        "Relevant" means an actual Discord reply to the brief's own ping or
+        evidence, not just a moderator being active in the channel afterward
+        - in a busy channel that would be almost every message.
+        """
+        guild = getattr(interaction, "guild", None)
+        source_channel_id = self.payload.source_channel_id
+        if guild is None or not source_channel_id:
+            return []
+
+        relevant_ids: set[int] = set()
+        for t in (self.payload.reply_targets or []) + (self.payload.evidence_quotes or []):
+            if not isinstance(t, dict):
+                continue
+            raw = t.get("message_id")
+            if raw is None:
+                continue
+            try:
+                relevant_ids.add(int(raw))
+            except (TypeError, ValueError):
+                continue
+        if not relevant_ids:
+            return []
+
+        after = since or (datetime.now(timezone.utc) - timedelta(seconds=_AUDIT_LOOKBACK_S))
+        found: list[str] = []
+        seen: set[int] = set()
+        try:
+            client = getattr(interaction, "client", None)
+            channel = await client.fetch_channel(source_channel_id)
+            async for msg in channel.history(after=after, limit=_AUDIT_SCAN_LIMIT):
+                if msg.id in seen:
+                    continue
+                ref = getattr(msg, "reference", None)
+                ref_id = getattr(ref, "message_id", None)
+                if ref_id not in relevant_ids:
+                    continue
+                # A guild channel's history hands back Member objects, not
+                # bare Users, so this has roles and guild_permissions to check
+                # - but never trust that hard enough to let one odd message
+                # abort the whole scan.
+                try:
+                    if getattr(msg.author, "bot", False) or not is_mod(
+                        msg.author, self.payload.mod_role_id
+                    ):
+                        continue
+                except AttributeError:
+                    continue
+                seen.add(msg.id)
+                who = (
+                    getattr(msg.author, "display_name", None)
+                    or getattr(msg.author, "name", None)
+                    or "unknown"
+                )
+                content = _truncate_one_line(msg.clean_content, 140)
+                found.append(f'Replied in channel: "{content}" · by {who}')
+                if len(found) >= _AUDIT_MAX_LINES:
+                    break
+        except discord.Forbidden:
+            return []
+        except Exception:
+            logger.exception("Failed to scan the channel for moderator replies")
             return []
         return found
 
