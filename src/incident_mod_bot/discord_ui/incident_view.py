@@ -27,6 +27,15 @@ _AUDIT_MAX_LINES = 8
 # between looks, giving up after the last one.
 _AUDIT_FOLLOW_UP_S = (30, 120, 300, 900)
 
+# A channel reply is a weaker signal than a real action - a moderator can say
+# "on it" before actually doing the thing. Showing the reply right away and
+# then never looking again would let a later action get permanently
+# stranded off the card. So once the normal schedule ends with only a reply
+# to show, keep checking the audit log alone - no need to rescan the
+# channel, the reply is already shown - a couple more times, out to roughly
+# the same "hour or two" horizon the lookback itself already assumes.
+_REPLY_EXTRA_FOLLOW_UP_S = (1800, 3600)
+
 _ACTION_FIELD = "Action taken:"
 
 # Background work has to be held onto. The event loop keeps only weak
@@ -450,15 +459,21 @@ class IncidentView(discord.ui.View):
         pressing the button and then going to do the thing is the normal order.
         The window always reaches back the full lookback from the press, so a
         later look never slides forward off an action it already had in range.
+
+        If all that schedule ever turns up is a channel reply, two more looks
+        follow at +30m and +60m, audit log only, in case a real action was
+        still coming - see _REPLY_EXTRA_FOLLOW_UP_S.
         """
         brief = getattr(message, "id", "?")
         since = datetime.now(timezone.utc) - timedelta(seconds=_AUDIT_LOOKBACK_S)
         shown: list[str] = []
+        shown_is_reply = False
         try:
             for wait_s in (0,) + tuple(_AUDIT_FOLLOW_UP_S):
                 if wait_s:
                     await asyncio.sleep(wait_s)
                 lines = await self._collect_recent_mod_actions(interaction, since=since)
+                is_reply = False
                 if not lines:
                     # No audit-log action doesn't mean nothing happened - often
                     # a moderator just answered in the channel. Only checked as
@@ -466,9 +481,11 @@ class IncidentView(discord.ui.View):
                     lines = await self._collect_recent_mod_channel_replies(
                         interaction, since=since
                     )
+                    is_reply = bool(lines)
                 if not lines or lines == shown:
                     continue
                 shown = lines
+                shown_is_reply = is_reply
                 await self._show_action_summary(message, shown)
                 logger.info("Action summary for brief %s: %s", brief, "; ".join(shown))
                 if self.memory_store is not None:
@@ -477,6 +494,31 @@ class IncidentView(discord.ui.View):
                         "audit_summary",
                         outcome="; ".join(shown)[:500],
                     )
+
+            # A reply is provisional: a moderator can say "on it" before doing
+            # the thing. Don't stop watching just because the normal schedule
+            # ran out - keep checking the audit log alone, further apart, and
+            # let a real action overwrite the reply whenever it shows up.
+            if shown_is_reply:
+                for wait_s in _REPLY_EXTRA_FOLLOW_UP_S:
+                    await asyncio.sleep(wait_s)
+                    lines = await self._collect_recent_mod_actions(interaction, since=since)
+                    if not lines or lines == shown:
+                        continue
+                    shown = lines
+                    await self._show_action_summary(message, shown)
+                    logger.info(
+                        "Action summary for brief %s upgraded past a channel reply: %s",
+                        brief, "; ".join(shown),
+                    )
+                    if self.memory_store is not None:
+                        await self._log_enforcement(
+                            interaction,
+                            "audit_summary",
+                            outcome="; ".join(shown)[:500],
+                        )
+                    break
+
             if not shown:
                 # Deliberately nothing on the card. An empty field reads as a
                 # broken bot, so the record of having looked goes to the log.

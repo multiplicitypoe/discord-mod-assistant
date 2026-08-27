@@ -108,7 +108,7 @@ async def test_a_moderator_who_acts_after_pressing_is_still_noticed(monkeypatch)
     await view._attach_action_summary(object(), message)
 
     assert len(calls) >= 3, "it gave up before the moderator had acted"
-    shown = fields_named(message.embeds[0], "Action taken")
+    shown = fields_named(message.embeds[0], "Action taken:")
     assert shown, "the late ban never reached the card"
     assert "Banned testuser1" in shown[0].value
 
@@ -142,9 +142,66 @@ async def test_finding_nothing_leaves_the_card_alone_and_says_so(caplog, monkeyp
     await view._attach_action_summary(object(), message)
 
     assert message.edits == [], "an empty result should not touch the card"
-    assert not fields_named(message.embeds[0], "Action taken")
+    assert not fields_named(message.embeds[0], "Action taken:")
     assert any("audit" in r.message.lower() for r in caplog.records), \
         "having looked and found nothing should still be recorded"
+
+
+async def test_a_channel_reply_gets_superseded_by_a_later_real_action(monkeypatch):
+    """The race: a moderator replies in chat ("on it"), then actually takes
+    the action later. The normal schedule only ever sees the reply - the
+    extra follow-up exists purely to catch the action once it finally lands,
+    so the card doesn't get stuck looking more final than it actually is."""
+    monkeypatch.setattr(iv, "_AUDIT_FOLLOW_UP_S", (0, 0, 0, 0))
+    monkeypatch.setattr(iv, "_REPLY_EXTRA_FOLLOW_UP_S", (0, 0))
+    view = IncidentView(payload(), memory_store=None, view_store=None)
+
+    action_calls = []
+
+    async def actions(_interaction, since=None):
+        action_calls.append(since)
+        # 5 normal-schedule looks + 2 extra looks = 7 calls total. The real
+        # action only ever shows up on the very last one.
+        if len(action_calls) >= 7:
+            return ["Banned testuser1 · by Sable"]
+        return []
+
+    async def replies(_interaction, since=None):
+        return ['Replied in channel: "on it" · by Sable']
+
+    monkeypatch.setattr(view, "_collect_recent_mod_actions", actions)
+    monkeypatch.setattr(view, "_collect_recent_mod_channel_replies", replies)
+    message = brief_message()
+    await view._attach_action_summary(object(), message)
+
+    assert len(action_calls) == 7, "the extra follow-up looks never ran"
+    shown = fields_named(message.embeds[0], "Action taken:")
+    assert shown, "nothing ended up on the card"
+    assert "Banned testuser1" in shown[0].value, "the late action never superseded the reply"
+
+
+async def test_extra_looks_are_skipped_once_a_real_action_is_already_shown(monkeypatch):
+    """No need to keep watching, or to ever check the channel, once the
+    audit log already has the fuller story."""
+    monkeypatch.setattr(iv, "_AUDIT_FOLLOW_UP_S", (0,))
+    monkeypatch.setattr(iv, "_REPLY_EXTRA_FOLLOW_UP_S", (0, 0))
+    view = IncidentView(payload(), memory_store=None, view_store=None)
+
+    async def actions(_interaction, since=None):
+        return ["Banned testuser1 · by Sable"]
+
+    reply_calls = []
+
+    async def replies(_interaction, since=None):
+        reply_calls.append(1)
+        return []
+
+    monkeypatch.setattr(view, "_collect_recent_mod_actions", actions)
+    monkeypatch.setattr(view, "_collect_recent_mod_channel_replies", replies)
+    message = brief_message()
+    await view._attach_action_summary(object(), message)
+
+    assert reply_calls == [], "the channel should never be checked once a real action is already found"
 
 
 async def test_a_later_find_replaces_the_field_rather_than_stacking_a_second(monkeypatch):
@@ -163,6 +220,6 @@ async def test_a_later_find_replaces_the_field_rather_than_stacking_a_second(mon
     message = brief_message()
     await view._attach_action_summary(object(), message)
 
-    shown = fields_named(message.embeds[0], "Action taken")
+    shown = fields_named(message.embeds[0], "Action taken:")
     assert len(shown) == 1, "the card grew a second copy of the field"
     assert "Banned" in shown[0].value and "Deleted" in shown[0].value
