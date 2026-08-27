@@ -35,6 +35,11 @@ logger = logging.getLogger("incident_mod_bot")
 
 DEFAULT_AUTO_IGNORE_CATEGORY_NAMES = {"Moderation", "Logs", "Modmail", "Information"}
 
+# A voice channel carries a text chat too, and a ping typed there deserves the
+# same handling as one typed anywhere else - someone asking for a mod doesn't
+# care that the channel also happens to have a waveform in it.
+_AUTO_MOD_SOURCE_TYPES = (discord.TextChannel, discord.VoiceChannel, discord.StageChannel)
+
 
 def forwarded_content(message: Any) -> str:
     """Text carried inside a forwarded message.
@@ -359,11 +364,11 @@ class IncidentBot(discord.Client):
         )
         if not message.role_mentions and not mentions_modmail_bot:
             return
-        if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
+        if not isinstance(message.channel, _AUTO_MOD_SOURCE_TYPES + (discord.Thread,)):
             return
 
         source_parent = message.channel.parent if isinstance(message.channel, discord.Thread) else message.channel
-        if isinstance(source_parent, discord.TextChannel):
+        if isinstance(source_parent, _AUTO_MOD_SOURCE_TYPES):
             if source_parent.name.endswith("-news"):
                 return
             category = source_parent.category
@@ -396,11 +401,11 @@ class IncidentBot(discord.Client):
         if not self.settings.auto_mod_default_channel_id:
             return
         channel = message.channel
-        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        if not isinstance(channel, _AUTO_MOD_SOURCE_TYPES + (discord.Thread,)):
             return
 
         source_parent = channel.parent if isinstance(channel, discord.Thread) else channel
-        if not isinstance(source_parent, discord.TextChannel):
+        if not isinstance(source_parent, _AUTO_MOD_SOURCE_TYPES):
             return
 
         try:
