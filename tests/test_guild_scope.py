@@ -45,3 +45,13 @@ def test_empty_value_means_no_guild_is_active() -> None:
     settings = _settings(ACTIVE_GUILD_IDS="")
     assert settings.active_guild_ids == frozenset()
     assert not settings.is_active_guild(POE)
+
+
+def test_modmail_bot_user_ids_default_to_empty() -> None:
+    """Unset means the feature is off, not 'watch every bot'."""
+    assert _settings().modmail_bot_user_ids == frozenset()
+
+
+def test_modmail_bot_user_ids_parses_like_guild_ids() -> None:
+    settings = _settings(MODMAIL_BOT_USER_IDS=" 590765760092307456, 111 ,")
+    assert settings.modmail_bot_user_ids == frozenset({590765760092307456, 111})

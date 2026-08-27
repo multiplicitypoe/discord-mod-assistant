@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 OpenAIImageDetail = Literal["low", "high", "auto"]
@@ -26,6 +26,11 @@ class Settings:
     debug_logs: bool
     auto_mod_default_channel_id: int | None
     active_guild_ids: frozenset[int]
+    # A user pinging the modmail bot's own account directly (rather than
+    # opening a thread) is the same kind of thing a role ping is - someone
+    # needs a mod and doesn't know the right way to ask. Treated the same
+    # as an @-role trigger once the account id is configured here.
+    modmail_bot_user_ids: frozenset[int] = field(default_factory=frozenset)
 
     def is_active_guild(self, guild_id: int | None) -> bool:
         """Whether the bot should act on something that happened in this server."""
@@ -65,6 +70,12 @@ def _parse_guild_ids(raw: str | None) -> frozenset[int]:
     return frozenset(int(part) for part in raw.split(",") if part.strip())
 
 
+def _parse_user_ids(raw: str | None) -> frozenset[int]:
+    if not raw:
+        return frozenset()
+    return frozenset(int(part) for part in raw.split(",") if part.strip())
+
+
 def _parse_image_detail(value: str) -> OpenAIImageDetail:
     normalized = value.lower()
     if normalized not in {"low", "high", "auto"}:
@@ -99,4 +110,5 @@ def load_settings() -> Settings:
         if auto_mod_default_channel_value
         else None,
         active_guild_ids=_parse_guild_ids(_env_optional("ACTIVE_GUILD_IDS")),
+        modmail_bot_user_ids=_parse_user_ids(_env_optional("MODMAIL_BOT_USER_IDS")),
     )
