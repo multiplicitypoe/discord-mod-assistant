@@ -351,7 +351,13 @@ class IncidentBot(discord.Client):
             return
         if not self.settings.is_active_guild(message.guild.id):
             return
-        if not message.role_mentions:
+        # Pinging the modmail bot's own account directly is the same ask as
+        # pinging the mod role - someone needs a mod and reached for the
+        # wrong target. Treated as the same kind of trigger.
+        mentions_modmail_bot = any(
+            u.id in self.settings.modmail_bot_user_ids for u in message.mentions
+        )
+        if not message.role_mentions and not mentions_modmail_bot:
             return
         if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
             return
@@ -474,7 +480,7 @@ class IncidentBot(discord.Client):
             source_parent.name,
             message.author.id,
             display_name(message.author),
-            ",".join(f"{r.id}(@{r.name})" for r in message.role_mentions),
+            ",".join(f"{r.id}(@{r.name})" for r in message.role_mentions) or "(modmail bot mention)",
             dest_channel.id,
             dest_channel.name,
             message.id,
@@ -496,7 +502,9 @@ class IncidentBot(discord.Client):
         oldest = messages[0].created_at
         scan_label = f"last {human_timedelta(now - oldest)}"
 
-        role_names = ", ".join(f"@{r.name}" for r in message.role_mentions)
+        # No role mention means this was a direct ping of the modmail bot's
+        # own account - still worth naming what was actually summoned.
+        role_names = ", ".join(f"@{r.name}" for r in message.role_mentions) or "the modmail bot"
         ctx = (
             f"guild={guild.id}({guild.name!r}) "
             f"channel={getattr(channel, 'id', None)}({getattr(channel, 'name', None)!r}) "
