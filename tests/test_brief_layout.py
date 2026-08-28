@@ -77,19 +77,19 @@ def test_the_draft_reply_comes_before_the_evidence(bot):
     )
 
 
-def test_key_moments_are_dropped_when_they_only_restate_the_summary(bot):
+def test_what_happened_is_dropped_when_it_only_restates_the_summary(bot):
     names = field_names(bot._build_incident_embed(rmt_incident()))
-    assert "Key Moments" not in names
+    assert "What happened" not in names
 
 
-def test_key_moments_survive_for_genuinely_complex_incidents(bot):
+def test_what_happened_survives_for_genuinely_complex_incidents(bot):
     """Three or more people with real roles is where the narrative earns its place."""
     result = rmt_incident(participants=[
         Participant(user_id=1, name="a", role="offender", notes="x"),
         Participant(user_id=2, name="b", role="reporter", notes="y"),
         Participant(user_id=3, name="c", role="escalated", notes="z"),
     ])
-    assert "Key Moments" in field_names(bot._build_incident_embed(result))
+    assert "What happened" in field_names(bot._build_incident_embed(result))
 
 
 def test_bystanders_are_not_listed_as_involved(bot):

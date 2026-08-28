@@ -36,7 +36,7 @@ async def test_destructive_actions_are_not_on_the_default_view():
 
 
 async def test_the_button_moderators_actually_press_is_present_by_default():
-    assert any("action taken" in (l or "").lower() for l in labels(IncidentView(payload(), None, None)))
+    assert any("mark handled" in (l or "").lower() for l in labels(IncidentView(payload(), None, None)))
 
 
 async def test_the_default_view_is_small():

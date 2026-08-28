@@ -558,6 +558,7 @@ class IncidentBot(discord.Client):
             title="Auto Mod Brief",
             scan_label=scan_label,
             context=context,
+            informed_by=result.informed_by,
         )
 
         action_participants: list[dict[str, Any]] = []
@@ -1155,7 +1156,7 @@ class IncidentBot(discord.Client):
             else:
                 await interaction.edit_original_response(content="Incident analysis failed.")
             return
-        embed = self._build_incident_embed(result, scan_label=scan_label)
+        embed = self._build_incident_embed(result, scan_label=scan_label, informed_by=result.informed_by)
 
         action_participants: list[dict[str, Any]] = []
         seen_users: set[int] = set()
@@ -1338,7 +1339,9 @@ class IncidentBot(discord.Client):
                 await interaction.edit_original_response(content="Context menu analysis failed.")
             return
 
-        embed = self._build_incident_embed(result, scan_label=scan_label, context=context)
+        embed = self._build_incident_embed(
+            result, scan_label=scan_label, context=context, informed_by=result.informed_by
+        )
 
         action_participants: list[dict[str, Any]] = []
         seen_users: set[int] = set()
@@ -1886,6 +1889,7 @@ class IncidentBot(discord.Client):
             title=title,
             scan_label=scan_label,
             context=context,
+            informed_by=refined.informed_by,
         )
         new_payload = IncidentViewPayload(
             draft_message=refined.draft_message,
@@ -2033,6 +2037,7 @@ class IncidentBot(discord.Client):
             title=title,
             scan_label=scan_label,
             context=context,
+            informed_by=result.informed_by,
         )
         new_payload = IncidentViewPayload(
             draft_message=result.draft_message,
@@ -2375,6 +2380,9 @@ class IncidentBot(discord.Client):
         body = "\n".join(line for line in lines if line)
         if do_lines:
             body += "\n\n" + "\n".join(do_lines)
+        if informed_by:
+            observation = "observation" if informed_by == 1 else "observations"
+            body += f"\n\n*Informed by {informed_by} enforcement {observation}.*"
         embed.description = body
 
         actors = [p for p in result.participants if self._is_actor(p)]
