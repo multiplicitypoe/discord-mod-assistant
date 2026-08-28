@@ -40,6 +40,22 @@ DEFAULT_AUTO_IGNORE_CATEGORY_NAMES = {"Moderation", "Logs", "Modmail", "Informat
 # care that the channel also happens to have a waveform in it.
 _AUTO_MOD_SOURCE_TYPES = (discord.TextChannel, discord.VoiceChannel, discord.StageChannel)
 
+_MENTION_RE = re.compile(r"<@[&!]?\d+>")
+
+# A ping with no text of its own is a strong tell that the reporter is about
+# to explain in their very next message - waiting this long catches it before
+# deciding the brief is final. Restricted to the reporter's own follow-ups,
+# capped low: this is meant to catch "wait, let me explain", not fold in
+# whatever else the channel says in the meantime.
+_BARE_PING_FOLLOWUP_WAIT_S = 60
+_BARE_PING_FOLLOWUP_MAX_MESSAGES = 3
+_BARE_PING_FOLLOWUP_SCAN_LIMIT = 30
+
+
+def _is_bare_ping(message: discord.Message) -> bool:
+    """Whether a ping message carries no explanation of its own."""
+    return not _MENTION_RE.sub("", message.content).strip()
+
 
 def forwarded_content(message: Any) -> str:
     """Text carried inside a forwarded message.
@@ -639,6 +655,22 @@ class IncidentBot(discord.Client):
                 ctx=ctx,
             )
         )
+
+        if _is_bare_ping(message):
+            asyncio.create_task(
+                self._maybe_update_brief_with_followup(
+                    message=posted,
+                    view=view,
+                    anchor=message,
+                    messages=messages,
+                    scan_label=scan_label,
+                    title="Auto Mod Brief",
+                    context=context,
+                    mod_role_id=mod_role_id,
+                    guild_id=guild.id,
+                    ctx=ctx,
+                )
+            )
 
     async def _register_commands(self) -> None:
         # on_ready can fire multiple times on reconnect; keep this idempotent.
@@ -1889,6 +1921,147 @@ class IncidentBot(discord.Client):
             await self.view_store.save_view(record)
 
         self._dlog_ctx(ctx, "Updated brief after image check")
+
+    async def _maybe_update_brief_with_followup(
+        self,
+        *,
+        message: discord.Message,
+        view: IncidentView,
+        anchor: discord.Message,
+        messages: list[discord.Message],
+        scan_label: str,
+        title: str,
+        context: tuple[str, str | None] | None,
+        mod_role_id: int | None,
+        guild_id: int,
+        ctx: str,
+    ) -> None:
+        """A bare ping almost always gets explained a moment later, in a
+        message the initial scan window couldn't have seen - it only looks
+        backward from the ping. Wait, then fold the reporter's own follow-up
+        into a fresh analysis, rather than leave a brief built on an
+        unexplained ping and whatever ambiguous prior chat happened to be
+        nearby.
+        """
+        await asyncio.sleep(_BARE_PING_FOLLOWUP_WAIT_S)
+
+        channel = anchor.channel
+        if not isinstance(channel, _AUTO_MOD_SOURCE_TYPES):
+            return
+        try:
+            after_messages = [
+                m
+                async for m in channel.history(
+                    after=anchor, limit=_BARE_PING_FOLLOWUP_SCAN_LIMIT, oldest_first=True
+                )
+            ]
+        except (discord.Forbidden, discord.HTTPException):
+            return
+        follow_ups = [
+            m for m in after_messages if m.author.id == anchor.author.id and not m.author.bot
+        ][:_BARE_PING_FOLLOWUP_MAX_MESSAGES]
+        if not follow_ups:
+            self._dlog_ctx(ctx, "Bare ping had no follow-up from the reporter")
+            return
+
+        # A moderator may already have acted in the minute this took to wait
+        # for - don't reopen something that's already resolved.
+        if view.payload.handled:
+            self._dlog_ctx(ctx, "Bare ping follow-up found, but the brief is already handled")
+            return
+
+        augmented = messages + follow_ups
+        try:
+            result, raw_result, analysis_payload = await self._analyze_incident_messages(
+                guild_id=guild_id,
+                messages=augmented,
+                mod_role_id=mod_role_id,
+                anchor_message_id=anchor.id,
+                ctx=ctx,
+            )
+        except AuthenticationError:
+            logger.exception("OpenAI auth error during bare-ping follow-up analysis")
+            return
+        except Exception:
+            logger.exception("Bare-ping follow-up analysis failed")
+            return
+
+        action_participants: list[dict[str, Any]] = []
+        seen_users: set[int] = set()
+        for msg in augmented:
+            user_id = msg.author.id
+            if user_id in seen_users:
+                continue
+            seen_users.add(user_id)
+            m = msg.author if isinstance(msg.author, discord.Member) else None
+            action_participants.append(
+                {
+                    "user_id": user_id,
+                    "name": display_name(msg.author),
+                    "role": "mod" if is_mod(m, mod_role_id) else "member",
+                }
+            )
+            if len(action_participants) >= 25:
+                break
+
+        if view.payload.handled:
+            # Checked again: analysis just took a real amount of time.
+            self._dlog_ctx(ctx, "Bare ping follow-up ready, but the brief was handled meanwhile")
+            return
+
+        new_embed = self._build_incident_embed(
+            result,
+            title=title,
+            scan_label=scan_label,
+            context=context,
+        )
+        new_payload = IncidentViewPayload(
+            draft_message=result.draft_message,
+            reply_targets=[t.model_dump() for t in result.reply_targets],
+            draft_replies=[r.model_dump() for r in result.draft_replies],
+            memory_suggestions=result.memory_suggestions.model_dump(),
+            mod_role_id=mod_role_id,
+            participants=action_participants,
+            evidence_quotes=[q.model_dump() for q in result.evidence_quotes],
+            recommendations=list(result.recommendations or []),
+            rule_ids=[r.id for r in (result.rule_refs or [])],
+            source_channel_id=view.payload.source_channel_id,
+            allow_post=view.payload.allow_post,
+            allow_actions=view.payload.allow_actions,
+            handled=False,
+        )
+        new_view = IncidentView(
+            payload=new_payload,
+            memory_store=self.memory_store,
+            view_store=self.view_store,
+        )
+        try:
+            await message.edit(embed=new_embed, view=new_view)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            return
+
+        record = ViewRecord(
+            message_id=message.id,
+            channel_id=message.channel.id,
+            guild_id=message.guild.id if message.guild else 0,
+            payload=new_payload.to_dict(),
+            created_at=time.time(),
+        )
+        await self.view_store.save_view(record)
+        try:
+            await self.memory_store.save_incident_payload(
+                message.id,
+                guild_id,
+                {**analysis_payload, "source_channel_id": view.payload.source_channel_id},
+            )
+        except Exception:
+            logger.exception("Failed to persist incident payload for replay (follow-up)")
+
+        self._dlog_ctx(
+            ctx,
+            "Updated a bare-ping brief after the reporter's follow-up: %s",
+            (getattr(result, "headline", "") or "")[:80],
+        )
 
     async def _fetch_recent_messages_ending_at(
         self,
