@@ -2385,15 +2385,11 @@ class IncidentBot(discord.Client):
             body += f"\n\n*Informed by {informed_by} enforcement {observation}.*"
         embed.description = body
 
+        # Who's involved and what they did is already in the summary above;
+        # a separate field just repeated it word for word on the common case
+        # of a single actor, so it's gone. _is_actor still gates whether the
+        # incident is complex enough for "What happened" below.
         actors = [p for p in result.participants if self._is_actor(p)]
-        if actors:
-            rendered = [
-                p.name
-                + (f" ({p.role})" if p.role and p.role not in {"member", "user"} else "")
-                + (f": {p.notes}" if p.notes else "")
-                for p in actors[:4]
-            ]
-            embed.add_field(name="Involved", value=truncate("\n".join(rendered), 1024), inline=False)
 
         # Key Moments restates summary+evidence for simple incidents. Keep it
         # only where the narrative earns its place: 3+ people actually involved.
