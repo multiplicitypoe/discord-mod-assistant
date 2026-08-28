@@ -60,6 +60,25 @@ from incident_mod_bot.pipeline.incident import parse_incident_result
 _LINK_RE = re.compile(r"discord\.com/channels/(\d+)/(\d+)/(\d+)")
 
 
+async def populate_role_cache(guild: discord.Guild) -> None:
+    """login()-only sessions never get the gateway events that normally
+    populate a guild's role cache, so any message fetched this way resolves
+    real, still-existing role mentions as the literal string "@deleted-role"
+    (Message.clean_content's fallback for a role it can't find in cache) -
+    in the analysis input itself, not just anything cosmetic. fetch_roles()
+    gets the real roles over REST but, in this discord.py version, doesn't
+    write them into guild._roles on its own; done here by hand so every
+    message sharing this Guild object resolves correctly for the rest of
+    the run.
+    """
+    try:
+        roles = await guild.fetch_roles()
+    except (discord.Forbidden, discord.HTTPException):
+        print("warning: could not fetch roles - mentions may render as 'deleted role'", file=sys.stderr)
+        return
+    guild._roles = {r.id: r for r in roles}
+
+
 def _parse_target(
     raw: str, guild_arg: int | None, channel_arg: int | None
 ) -> tuple[int | None, int | None, int]:
@@ -136,6 +155,7 @@ async def _replay_from_live_history(
     await bot.login(settings.discord_token)
 
     channel = await bot.fetch_channel(channel_id)
+    await populate_role_cache(channel.guild)
     anchor = await channel.fetch_message(message_id)
 
     use_limit = limit or settings.default_limit
