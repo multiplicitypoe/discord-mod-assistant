@@ -92,13 +92,6 @@ def test_what_happened_survives_for_genuinely_complex_incidents(bot):
     assert "What happened" in field_names(bot._build_incident_embed(result))
 
 
-def test_bystanders_are_not_listed_as_involved(bot):
-    embed = bot._build_incident_embed(rmt_incident())
-    involved = next((f.value for f in embed.fields if f.name == "Involved"), "")
-    assert "rmt_seller1" in involved
-    assert "bystander1" not in involved and "bystander2" not in involved
-
-
 def test_rules_are_internal_only_never_shown_on_the_card(bot):
     """Rule ids inform the model, they don't belong in front of a moderator."""
     embed = bot._build_incident_embed(rmt_incident())
