@@ -1538,6 +1538,29 @@ class IncidentBot(discord.Client):
             tuple((n.user_id, n.label, n.evidence_message_id) for n in result.memory_suggestions.user_notes),
         )
 
+    @staticmethod
+    def _apply_handled_look(embed: discord.Embed, current_message: discord.Message) -> None:
+        """Match what pressing Mark Handled does to an embed: green, no Draft
+        reply, same "Marked Handled by X" attribution. Used when a background
+        update (images, bare-ping follow-up) lands on a brief that's already
+        been marked handled - the content should still catch up, but it must
+        keep reading as resolved rather than quietly reopening it.
+        """
+        embed.color = discord.Color.green()
+        for index, existing in enumerate(embed.fields):
+            if existing.name == "Draft reply":
+                embed.remove_field(index)
+                break
+        old_footer = ""
+        if current_message.embeds and current_message.embeds[0].footer:
+            old_footer = current_message.embeds[0].footer.text or ""
+        marker = "Marked Handled by "
+        idx = old_footer.find(marker)
+        handled_note = old_footer[idx:] if idx != -1 else old_footer
+        if handled_note:
+            new_footer = embed.footer.text or ""
+            embed.set_footer(text=f"{new_footer} | {handled_note}" if new_footer else handled_note)
+
     async def _maybe_update_brief_with_images(
         self,
         *,
@@ -1884,6 +1907,7 @@ class IncidentBot(discord.Client):
         if self._incident_signature(refined) == self._incident_signature(base_result):
             return
 
+        now_handled = view.payload.handled
         new_embed = self._build_incident_embed(
             refined,
             title=title,
@@ -1891,6 +1915,8 @@ class IncidentBot(discord.Client):
             context=context,
             informed_by=refined.informed_by,
         )
+        if now_handled:
+            self._apply_handled_look(new_embed, message)
         new_payload = IncidentViewPayload(
             draft_message=refined.draft_message,
             reply_targets=[t.model_dump() for t in refined.reply_targets],
@@ -1905,7 +1931,7 @@ class IncidentBot(discord.Client):
             allow_post=view.payload.allow_post,
             allow_actions=view.payload.allow_actions,
             anchor_message_id=view.payload.anchor_message_id,
-            handled=False,
+            handled=now_handled,
         )
         new_view = IncidentView(
             payload=new_payload,
@@ -1974,11 +2000,8 @@ class IncidentBot(discord.Client):
             self._dlog_ctx(ctx, "Bare ping had no follow-up from the reporter")
             return
 
-        # A moderator may already have acted in the minute this took to wait
-        # for - don't reopen something that's already resolved.
         if view.payload.handled:
-            self._dlog_ctx(ctx, "Bare ping follow-up found, but the brief is already handled")
-            return
+            self._dlog_ctx(ctx, "Bare ping follow-up found on an already-handled brief - still updating the content")
 
         # messages was fetched once at the original ping and is held in
         # memory, not re-fetched here - so if the reported content gets
@@ -2027,10 +2050,13 @@ class IncidentBot(discord.Client):
             if len(action_participants) >= 25:
                 break
 
-        if view.payload.handled:
-            # Checked again: analysis just took a real amount of time.
-            self._dlog_ctx(ctx, "Bare ping follow-up ready, but the brief was handled meanwhile")
-            return
+        # Checked again here, as late as possible: analysis just took a real
+        # amount of time, and a moderator may have pressed Mark Handled while
+        # it ran. Either way the content below is worth showing - it just
+        # must not reopen something that's already resolved.
+        now_handled = view.payload.handled
+        if now_handled:
+            self._dlog_ctx(ctx, "Bare ping follow-up ready on a handled brief - updating content only")
 
         new_embed = self._build_incident_embed(
             result,
@@ -2039,6 +2065,8 @@ class IncidentBot(discord.Client):
             context=context,
             informed_by=result.informed_by,
         )
+        if now_handled:
+            self._apply_handled_look(new_embed, message)
         new_payload = IncidentViewPayload(
             draft_message=result.draft_message,
             reply_targets=[t.model_dump() for t in result.reply_targets],
@@ -2053,7 +2081,7 @@ class IncidentBot(discord.Client):
             allow_post=view.payload.allow_post,
             allow_actions=view.payload.allow_actions,
             anchor_message_id=anchor.id,
-            handled=False,
+            handled=now_handled,
         )
         new_view = IncidentView(
             payload=new_payload,
