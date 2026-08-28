@@ -57,6 +57,7 @@ from incident_mod_bot.bot import (
 from incident_mod_bot.config import load_settings
 from incident_mod_bot.discord_ui.incident_view import IncidentViewPayload
 from incident_mod_bot.discord_ui.view_store import ViewRecord
+from incident_mod_bot.replay import populate_role_cache
 
 _LINK_RE = re.compile(r"discord\.com/channels/(\d+)/(\d+)/(\d+)")
 
@@ -117,6 +118,7 @@ async def _run(target: str, *, apply: bool) -> None:
         dest_channel = await bot.fetch_channel(dest_channel_id)
         brief_message = await dest_channel.fetch_message(brief_message_id)
         source_channel = await bot.fetch_channel(source_channel_id)
+        await populate_role_cache(source_channel.guild)
         anchor = await source_channel.fetch_message(int(anchor_id))
 
         print(f"anchor: {anchor.author} @ {anchor.created_at}: {anchor.content!r}", file=sys.stderr)
