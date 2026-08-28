@@ -76,7 +76,7 @@ def test_report_never_leaks_user_ids():
     assert "555" not in text and "556" not in text
 
 
-# --- the "informed by" line on briefs --------------------------------------
+# --- enforcement history informs the brief, but never says so on the card --
 
 @pytest.fixture
 def bot():
@@ -92,12 +92,10 @@ def minimal_result():
     )
 
 
-def test_a_brief_that_used_history_says_so(bot):
-    embed = bot._build_incident_embed(minimal_result(), informed_by=3)
-    assert "informed by" in (embed.description or "").lower()
-    assert "3" in embed.description
-
-
-def test_a_brief_with_no_history_stays_quiet(bot):
-    embed = bot._build_incident_embed(minimal_result(), informed_by=0)
+def test_the_card_never_mentions_enforcement_history(bot):
+    """informed_by is tracked internally (see enforcement_stats) but was never
+    something a moderator could act on as a bare count, so it doesn't render."""
+    result = minimal_result()
+    result.informed_by = 3
+    embed = bot._build_incident_embed(result)
     assert "informed by" not in (embed.description or "").lower()

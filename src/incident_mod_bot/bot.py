@@ -42,13 +42,12 @@ _AUTO_MOD_SOURCE_TYPES = (discord.TextChannel, discord.VoiceChannel, discord.Sta
 
 _MENTION_RE = re.compile(r"<@[&!]?\d+>")
 
-# A ping with no text of its own is a strong tell that the reporter is about
-# to explain in their very next message - waiting this long catches it before
-# deciding the brief is final. Restricted to the reporter's own follow-ups,
-# capped low: this is meant to catch "wait, let me explain", not fold in
-# whatever else the channel says in the meantime.
+# A ping with no text of its own is a strong tell that the situation is about
+# to get explained, corrected, or waved off in the very next minute - waiting
+# this long catches that before deciding the brief is final. Not restricted to
+# the reporter: a real incident showed other members and the handling
+# moderator all reacting within the window too, and all of it mattered.
 _BARE_PING_FOLLOWUP_WAIT_S = 60
-_BARE_PING_FOLLOWUP_MAX_MESSAGES = 3
 _BARE_PING_FOLLOWUP_SCAN_LIMIT = 30
 
 
@@ -558,7 +557,6 @@ class IncidentBot(discord.Client):
             title="Auto Mod Brief",
             scan_label=scan_label,
             context=context,
-            informed_by=result.informed_by,
         )
 
         action_participants: list[dict[str, Any]] = []
@@ -1156,7 +1154,7 @@ class IncidentBot(discord.Client):
             else:
                 await interaction.edit_original_response(content="Incident analysis failed.")
             return
-        embed = self._build_incident_embed(result, scan_label=scan_label, informed_by=result.informed_by)
+        embed = self._build_incident_embed(result, scan_label=scan_label)
 
         action_participants: list[dict[str, Any]] = []
         seen_users: set[int] = set()
@@ -1339,9 +1337,7 @@ class IncidentBot(discord.Client):
                 await interaction.edit_original_response(content="Context menu analysis failed.")
             return
 
-        embed = self._build_incident_embed(
-            result, scan_label=scan_label, context=context, informed_by=result.informed_by
-        )
+        embed = self._build_incident_embed(result, scan_label=scan_label, context=context)
 
         action_participants: list[dict[str, Any]] = []
         seen_users: set[int] = set()
@@ -1913,7 +1909,6 @@ class IncidentBot(discord.Client):
             title=title,
             scan_label=scan_label,
             context=context,
-            informed_by=refined.informed_by,
         )
         if now_handled:
             self._apply_handled_look(new_embed, message)
@@ -1971,13 +1966,17 @@ class IncidentBot(discord.Client):
         guild_id: int,
         ctx: str,
     ) -> None:
-        """A bare ping almost always gets explained a moment later, in a
-        message the initial scan window couldn't have seen - it only looks
-        backward from the ping. Wait, then fold the reporter's own follow-up
-        into a fresh analysis, rather than leave a brief built on an
-        unexplained ping and whatever ambiguous prior chat happened to be
-        nearby. The initial brief posts immediately regardless - this only
-        ever edits it afterward, never delays it.
+        """A bare ping almost always gets explained a moment later, in
+        messages the initial scan window couldn't have seen - it only looks
+        backward from the ping. Wait, then fold what actually happened next
+        into a fresh analysis: not just the reporter explaining themselves,
+        but anyone else's reaction, correction, or pushback too. A real
+        incident showed why the reporter alone isn't enough - two other
+        members and the moderator who eventually handled it all read the
+        ping as unfounded in the minute right after it, and none of that
+        reached the model when only the reporter's own words counted. The
+        initial brief posts immediately regardless - this only ever edits it
+        afterward, never delays it.
         """
         await asyncio.sleep(_BARE_PING_FOLLOWUP_WAIT_S)
 
@@ -1985,19 +1984,17 @@ class IncidentBot(discord.Client):
         if not isinstance(channel, _AUTO_MOD_SOURCE_TYPES):
             return
         try:
-            after_messages = [
+            follow_ups = [
                 m
                 async for m in channel.history(
                     after=anchor, limit=_BARE_PING_FOLLOWUP_SCAN_LIMIT, oldest_first=True
                 )
+                if not m.author.bot
             ]
         except (discord.Forbidden, discord.HTTPException):
             return
-        follow_ups = [
-            m for m in after_messages if m.author.id == anchor.author.id and not m.author.bot
-        ][:_BARE_PING_FOLLOWUP_MAX_MESSAGES]
         if not follow_ups:
-            self._dlog_ctx(ctx, "Bare ping had no follow-up from the reporter")
+            self._dlog_ctx(ctx, "Nothing happened in the channel after the bare ping")
             return
 
         if view.payload.handled:
@@ -2063,7 +2060,6 @@ class IncidentBot(discord.Client):
             title=title,
             scan_label=scan_label,
             context=context,
-            informed_by=result.informed_by,
         )
         if now_handled:
             self._apply_handled_look(new_embed, message)
@@ -2375,7 +2371,6 @@ class IncidentBot(discord.Client):
         title: str = "Mod Brief",
         scan_label: str | None = None,
         context: tuple[str, str | None] | None = None,
-        informed_by: int = 0,
     ) -> discord.Embed:
         headline = (getattr(result, "headline", "") or "").strip()
         # The title is the slot people skim past, so it carries what raised the
@@ -2408,9 +2403,6 @@ class IncidentBot(discord.Client):
         body = "\n".join(line for line in lines if line)
         if do_lines:
             body += "\n\n" + "\n".join(do_lines)
-        if informed_by:
-            observation = "observation" if informed_by == 1 else "observations"
-            body += f"\n\n*Informed by {informed_by} enforcement {observation}.*"
         embed.description = body
 
         # Who's involved and what they did is already in the summary above;
