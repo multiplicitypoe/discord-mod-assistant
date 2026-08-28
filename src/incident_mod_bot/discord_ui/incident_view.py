@@ -15,12 +15,26 @@ from incident_mod_bot.utils.discord import is_mod
 
 logger = logging.getLogger("incident_mod_bot")
 
-# How far back to look for moderation done outside the brief, and how much of
-# the audit log to walk. Most incidents are closed inside an hour or two, so a
-# wider window mostly adds unrelated actions rather than missing ones.
-_AUDIT_LOOKBACK_S = 2 * 3600
+# How far before the incident itself to look for context, and how much of
+# the audit log to walk. Anchored to the ping (or flagged message), not to
+# whenever a moderator happens to press Mark Handled - that used to mean a
+# slow-to-notice press could drag the window back hours, and a fast one
+# reached backward into moderation from well before the incident even
+# started. A real case: a brief handled ~90 seconds after its own ping still
+# picked up an unrelated timeout from 1h25m earlier in the same busy channel,
+# purely because "now" (the press) minus 2h happened to still cover it.
+# Falls back to "now" when there's no anchor - a manually-run /mod scan has
+# no single triggering message.
+_AUDIT_LOOKBACK_BEFORE_S = 20 * 60
 _AUDIT_SCAN_LIMIT = 200
 _AUDIT_MAX_LINES = 8
+_DISCORD_EPOCH_MS = 1420070400000
+
+
+def _snowflake_created_at(snowflake_id: int) -> datetime:
+    return datetime.fromtimestamp(
+        ((snowflake_id >> 22) + _DISCORD_EPOCH_MS) / 1000, tz=timezone.utc
+    )
 
 # Moderators often press Action Taken and then go and do the thing, so a single
 # look at the moment of the press is usually too early. Wait these many seconds
@@ -99,6 +113,12 @@ class IncidentViewPayload:
     # read the brief and press Action Taken; Ban sitting next to it is a mis-tap
     # waiting to happen on mobile.
     expanded: bool = False
+    # The message that actually triggered this brief (the ping, or the
+    # flagged message for a context-menu run) - None for a manually-invoked
+    # /mod scan, which has no single triggering message. Lets audit/reply
+    # lookback anchor to when the incident happened instead of to whenever a
+    # moderator happens to press Mark Handled, which can be much later.
+    anchor_message_id: int | None = None
     # Bump when component custom_id layout changes.
     view_version: int = 3
 
@@ -119,6 +139,7 @@ class IncidentViewPayload:
             "recommendations": self.recommendations,
             "rule_ids": self.rule_ids,
             "expanded": self.expanded,
+            "anchor_message_id": self.anchor_message_id,
         }
 
 
@@ -448,6 +469,18 @@ class IncidentView(discord.ui.View):
                 out.append(member)
         return out
 
+    def _audit_window_start(self) -> datetime:
+        """Where the audit-log/channel-reply lookback begins.
+
+        Anchored to the incident's own trigger message when we have one, not
+        to "now" - "now" at this call site is whenever Mark Handled happens
+        to get pressed, which can be seconds or hours after the actual ping.
+        """
+        anchor_id = self.payload.anchor_message_id
+        if anchor_id:
+            return _snowflake_created_at(anchor_id) - timedelta(seconds=_AUDIT_LOOKBACK_BEFORE_S)
+        return datetime.now(timezone.utc) - timedelta(seconds=_AUDIT_LOOKBACK_BEFORE_S)
+
     async def _attach_action_summary(self, interaction: Any, message: Any) -> None:
         """Add what the audit log says was done, after the button has responded.
 
@@ -457,15 +490,17 @@ class IncidentView(discord.ui.View):
 
         It looks again at 30s, 2m, 7m and 22m after the press, because
         pressing the button and then going to do the thing is the normal order.
-        The window always reaches back the full lookback from the press, so a
-        later look never slides forward off an action it already had in range.
+        The window always reaches back the full lookback from the incident's
+        own trigger message, so a later look never slides forward off an
+        action it already had in range - and an incident handled quickly
+        doesn't reach backward past its own start either.
 
         If all that schedule ever turns up is a channel reply, two more looks
         follow at +30m and +60m, audit log only, in case a real action was
         still coming - see _REPLY_EXTRA_FOLLOW_UP_S.
         """
         brief = getattr(message, "id", "?")
-        since = datetime.now(timezone.utc) - timedelta(seconds=_AUDIT_LOOKBACK_S)
+        since = self._audit_window_start()
         shown: list[str] = []
         shown_is_reply = False
         try:
@@ -582,7 +617,7 @@ class IncidentView(discord.ui.View):
             participant_ids.add(pid)
             names[pid] = str(p.get("name") or pid)
         participant_ids.update(int(u) for u in self.selected_user_ids)
-        after = since or (datetime.now(timezone.utc) - timedelta(seconds=_AUDIT_LOOKBACK_S))
+        after = since or self._audit_window_start()
         found: list[str] = []
         seen: set[tuple] = set()
         try:
@@ -720,7 +755,7 @@ class IncidentView(discord.ui.View):
         if not relevant_ids:
             return []
 
-        after = since or (datetime.now(timezone.utc) - timedelta(seconds=_AUDIT_LOOKBACK_S))
+        after = since or self._audit_window_start()
 
         def _is_mod_author(msg: Any) -> bool:
             try:
@@ -1165,6 +1200,7 @@ class IncidentView(discord.ui.View):
             source_channel_id=self.payload.source_channel_id,
             allow_post=self.payload.allow_post,
             allow_actions=self.payload.allow_actions,
+            anchor_message_id=self.payload.anchor_message_id,
             handled=True,
         )
         self.payload = handled_payload

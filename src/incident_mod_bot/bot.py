@@ -591,6 +591,7 @@ class IncidentBot(discord.Client):
             source_channel_id=channel.id,
             allow_post=True,
             allow_actions=True,
+            anchor_message_id=message.id,
             handled=False,
         )
         view = IncidentView(
@@ -662,6 +663,7 @@ class IncidentBot(discord.Client):
                     message=posted,
                     view=view,
                     anchor=message,
+                    base_result=result,
                     messages=messages,
                     scan_label=scan_label,
                     title="Auto Mod Brief",
@@ -1369,6 +1371,7 @@ class IncidentBot(discord.Client):
             source_channel_id=channel.id,
             allow_post=True,
             allow_actions=True,
+            anchor_message_id=message.id,
             handled=False,
         )
         view = IncidentView(
@@ -1897,6 +1900,7 @@ class IncidentBot(discord.Client):
             source_channel_id=view.payload.source_channel_id,
             allow_post=view.payload.allow_post,
             allow_actions=view.payload.allow_actions,
+            anchor_message_id=view.payload.anchor_message_id,
             handled=False,
         )
         new_view = IncidentView(
@@ -1928,6 +1932,7 @@ class IncidentBot(discord.Client):
         message: discord.Message,
         view: IncidentView,
         anchor: discord.Message,
+        base_result: IncidentResult,
         messages: list[discord.Message],
         scan_label: str,
         title: str,
@@ -1941,7 +1946,8 @@ class IncidentBot(discord.Client):
         backward from the ping. Wait, then fold the reporter's own follow-up
         into a fresh analysis, rather than leave a brief built on an
         unexplained ping and whatever ambiguous prior chat happened to be
-        nearby.
+        nearby. The initial brief posts immediately regardless - this only
+        ever edits it afterward, never delays it.
         """
         await asyncio.sleep(_BARE_PING_FOLLOWUP_WAIT_S)
 
@@ -1970,6 +1976,11 @@ class IncidentBot(discord.Client):
             self._dlog_ctx(ctx, "Bare ping follow-up found, but the brief is already handled")
             return
 
+        # messages was fetched once at the original ping and is held in
+        # memory, not re-fetched here - so if the reported content gets
+        # deleted in the minute this waited (routine: deletion is often the
+        # enforcement action itself), the re-analysis still sees exactly
+        # what the original brief saw. Only follow_ups is freshly fetched.
         augmented = messages + follow_ups
         try:
             result, raw_result, analysis_payload = await self._analyze_incident_messages(
@@ -1984,6 +1995,14 @@ class IncidentBot(discord.Client):
             return
         except Exception:
             logger.exception("Bare-ping follow-up analysis failed")
+            return
+
+        # The reporter's follow-up doesn't always change the read - "he did
+        # it again" adds nothing a moderator couldn't already see. Compare
+        # against what was already posted and only touch the card when the
+        # follow-up actually moved something.
+        if self._incident_signature(result) == self._incident_signature(base_result):
+            self._dlog_ctx(ctx, "Bare ping follow-up did not change the read")
             return
 
         action_participants: list[dict[str, Any]] = []
@@ -2028,6 +2047,7 @@ class IncidentBot(discord.Client):
             source_channel_id=view.payload.source_channel_id,
             allow_post=view.payload.allow_post,
             allow_actions=view.payload.allow_actions,
+            anchor_message_id=anchor.id,
             handled=False,
         )
         new_view = IncidentView(
@@ -2445,6 +2465,9 @@ class IncidentBot(discord.Client):
             draft_replies = payload.get("draft_replies")
             if not isinstance(draft_replies, list):
                 draft_replies = []
+            anchor_message_id = payload.get("anchor_message_id")
+            if anchor_message_id is not None and not isinstance(anchor_message_id, int):
+                anchor_message_id = None
             view_payload = IncidentViewPayload(
                 view_version=3,
                 recommendations=list(payload.get("recommendations") or []),
@@ -2459,6 +2482,7 @@ class IncidentBot(discord.Client):
                 source_channel_id=source_channel_id,
                 allow_post=allow_post_bool,
                 allow_actions=allow_actions_bool,
+                anchor_message_id=anchor_message_id,
                 handled=handled_bool,
             )
             view = IncidentView(
