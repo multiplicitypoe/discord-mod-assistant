@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "discord-incident-assistant"
+name = "discord-mod-assistant"
 version = "0.1.0"
 description = "Discord moderation assistant with /incident summaries and memory."
 authors = ["Your Name <you@example.com>"]

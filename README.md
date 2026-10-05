@@ -1,4 +1,4 @@
-# Discord Incident Assistant
+# Discord Mod Assistant
 
 Mod-only `/mod` command that summarizes the last N messages (default 50), reads images, and drafts a polite, firm de-escalation message with evidence. Includes lightweight, opt-in memory so the bot can learn server tone and repeated behavioral patterns over time.
 
@@ -46,7 +46,7 @@ make build-docker
 make run-docker
 ```
 
-`make run-docker` uses a fixed container name (`discord-incident-assistant`), stops/removes an existing container with that name, then starts a fresh one. This keeps restarts idempotent (including supervisor reloads).
+`make run-docker` uses a fixed container name (`discord-mod-assistant`), stops/removes an existing container with that name, then starts a fresh one. This keeps restarts idempotent (including supervisor reloads).
 
 Useful extra:
 

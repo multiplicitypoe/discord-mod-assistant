@@ -151,6 +151,78 @@ class MemoryStore:
         except json.JSONDecodeError:
             return None
 
+    async def list_earlier_pings(
+        self,
+        guild_id: int,
+        reporter_user_id: int,
+        *,
+        before_message_id: int,
+        window_s: int,
+        limit: int = 100,
+    ) -> tuple[list[tuple[int, dict[str, Any]]], dict[int, str]]:
+        """Earlier briefs this person triggered by pinging, and how each was
+        handled, both as of before_message_id (the current ping).
+
+        A brief's id is a snowflake posted after its own ping, so the id range
+        alone bounds the time window and the primary key serves it; no scan
+        of payload_json outside the window. Handling only counts if it was
+        recorded before the current ping, so a replay sees what the live
+        brief saw.
+        """
+        conn = self._require_conn()
+        anchor_ms = (int(before_message_id) >> 22) + 1420070400000
+        since_id = max(anchor_ms - window_s * 1000 - 1420070400000, 0) << 22
+        cursor = await conn.execute(
+            """
+            SELECT brief_message_id, payload_json FROM incident_payloads
+            WHERE guild_id = ? AND brief_message_id >= ? AND brief_message_id < ?
+            ORDER BY brief_message_id DESC LIMIT ?
+            """,
+            (guild_id, since_id, before_message_id, limit),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        earlier: list[tuple[int, dict[str, Any]]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                continue
+            reporter = payload.get("reporter") if isinstance(payload, dict) else None
+            if isinstance(reporter, dict) and reporter.get("user_id") == reporter_user_id:
+                earlier.append((int(row["brief_message_id"]), payload))
+        if not earlier:
+            return [], {}
+
+        ids = [brief_id for brief_id, _ in earlier]
+        marks = ",".join("?" for _ in ids)
+        cursor = await conn.execute(
+            f"""
+            SELECT brief_message_id, action, recommended, outcome FROM enforcement_log
+            WHERE guild_id = ? AND brief_message_id IN ({marks}) AND created_at <= ?
+            ORDER BY created_at, id
+            """,
+            (guild_id, *ids, anchor_ms // 1000),
+        )
+        enforcement = await cursor.fetchall()
+        await cursor.close()
+        outcomes: dict[int, str] = {}
+        for row in enforcement:
+            brief_id = int(row["brief_message_id"])
+            if row["action"] == "audit_summary" and row["outcome"]:
+                # What a moderator actually did beats what the brief suggested.
+                outcomes[brief_id] = str(row["outcome"])
+                continue
+            if brief_id in outcomes:
+                continue
+            try:
+                recommended = json.loads(row["recommended"] or "[]")
+            except (TypeError, ValueError):
+                recommended = []
+            label = str(recommended[0]).rstrip(".") if recommended else str(row["action"])
+            outcomes[brief_id] = label
+        return earlier, outcomes
+
     async def get_auto_mod_config(self, guild_id: int) -> dict[str, object]:
         conn = self._require_conn()
         cursor = await conn.execute(

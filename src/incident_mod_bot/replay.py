@@ -34,12 +34,23 @@ concurrently with it. Meant to run inside the already-built image, which has
 every dependency and the right env already:
 
     sudo -n docker run --rm --env-file .env -v $(pwd)/data:/app/data \\
-        --user "$(id -u):$(id -g)" discord-incident-assistant \\
+        --user "$(id -u):$(id -g)" discord-mod-assistant \\
         python -m incident_mod_bot.replay <link>
 
-Does not run the image-refinement pass (refine_incident_with_images) - text
-only, which is where every wording complaint so far has landed. Pass --raw
-to see the model's actual JSON alongside the rendered embed.
+A saved payload is replayed the way the current code would build it from
+the same messages: the reporter's pointer to the reported message is
+recomputed, and their earlier pings are read from the same db as of the
+ping. --as-saved sends the stored payload untouched instead.
+
+--images also sends the analysis pass the images the live bot would pick
+(the reported message, the ping, and the messages next to it). Images are
+never stored, so this logs in over REST (Client.login(), no gateway) and
+fetches those messages and their attachments: reads only. If they have been
+deleted since, it says so and runs on text. It does not run the background
+refinement pass (refine_incident_with_images).
+
+--raw prints the model's actual JSON alongside the rendered embed, and
+--show-payload the exact payload sent (image bytes left out).
 """
 from __future__ import annotations
 
@@ -48,14 +59,16 @@ import asyncio
 import json
 import re
 import sys
+import time
 
 import discord
 from dotenv import load_dotenv
 
-from incident_mod_bot.bot import IncidentBot
+from incident_mod_bot.bot import IncidentBot, _consistent_author_names, _with_likely_reported
 from incident_mod_bot.config import load_settings
 from incident_mod_bot.openai_client import OpenAISettings, analyze_incident, create_client
-from incident_mod_bot.pipeline.incident import parse_incident_result
+from incident_mod_bot.pipeline.incident import known_users_from_payload, parse_incident_result
+from incident_mod_bot.pipeline.ping_context import format_ping_history
 
 _LINK_RE = re.compile(r"discord\.com/channels/(\d+)/(\d+)/(\d+)")
 
@@ -107,10 +120,62 @@ def _render(embed: discord.Embed, *, scan_label: str) -> str:
 
 
 async def _replay_from_saved_payload(
-    bot: IncidentBot, guild_id: int, payload: dict, *, show_raw: bool
+    bot: IncidentBot,
+    guild_id: int,
+    payload: dict,
+    *,
+    show_raw: bool,
+    as_saved: bool = False,
+    with_images: bool = False,
+    show_payload: bool = False,
 ) -> None:
     settings = bot.settings
     channel_id = payload.pop("source_channel_id", None)
+    anchor_id = payload.get("anchor_message_id")
+    reporter = payload.get("reporter")
+    if reporter and not as_saved:
+        # What the current code builds from the same messages.
+        payload["messages"] = _consistent_author_names(
+            payload.get("messages") or [], {reporter.get("user_id"): reporter.get("name")}
+        )
+        payload["reporter"] = _with_likely_reported(reporter, payload["messages"], anchor_id)
+        if isinstance(anchor_id, int):
+            history = await bot._ping_history(guild_id, payload["reporter"], anchor_id)
+            if history:
+                payload["reporter"]["recent_pings"] = history
+
+    images: list[dict] = []
+    if with_images:
+        if channel_id is None:
+            print("warning: payload has no source channel; no images", file=sys.stderr)
+        else:
+            await bot.login(settings.discord_token)
+            channel = await bot.fetch_channel(channel_id)
+            t0 = time.monotonic()
+            # One history call for the neighbourhood, like the live bot
+            # already holding the window; single fetches only for the rest.
+            live: dict[int, discord.Message] = {}
+            if isinstance(anchor_id, int):
+                try:
+                    async for msg in channel.history(around=discord.Object(anchor_id), limit=21):
+                        live[msg.id] = msg
+                except discord.HTTPException:
+                    pass
+            images, used = await bot._collect_analysis_images(
+                payload, live=live, fetch_message=channel.fetch_message, fetch_unlisted=True
+            )
+            print(
+                f"(images: {len(images)} sent, from {sorted(used)}, "
+                f"{sum(len(i['data_url']) for i in images)} data-url chars, "
+                f"collected in {time.monotonic() - t0:.2f}s)",
+                file=sys.stderr,
+            )
+
+    if show_payload:
+        print("--- payload sent ---")
+        print(json.dumps(payload, indent=1, ensure_ascii=False))
+        print("--- end payload ---")
+
     openai_settings = OpenAISettings(
         api_key=settings.openai_api_key,
         model=settings.openai_model,
@@ -118,21 +183,27 @@ async def _replay_from_saved_payload(
         debug_logs=settings.debug_logs,
     )
     client = create_client(settings.openai_api_key)
+    t0 = time.monotonic()
     try:
-        raw = await asyncio.to_thread(analyze_incident, client, openai_settings, payload)
+        raw = await asyncio.to_thread(
+            analyze_incident, client, openai_settings, payload, images or None
+        )
     finally:
         try:
             client.close()
         except Exception:
             pass
-    result = parse_incident_result(raw)
+    print(f"(analyze_incident took {time.monotonic() - t0:.2f}s)", file=sys.stderr)
+    result = parse_incident_result(raw, known_users_from_payload(payload))
+    result.ping_history = format_ping_history((payload.get("reporter") or {}).get("recent_pings"))
     if channel_id is not None:
         for q in result.evidence_quotes:
             if not q.link and q.message_id:
                 q.link = f"https://discord.com/channels/{guild_id}/{channel_id}/{q.message_id}"
 
     n_msgs = len(payload.get("messages") or [])
-    scan_label = f"{n_msgs} msgs | replay from saved payload, no image pass"
+    mode = "as saved" if as_saved else "rebuilt by current code"
+    scan_label = f"{n_msgs} msgs | replay from saved payload ({mode}), {len(images)} image(s)"
     embed = bot._build_incident_embed(result, scan_label=scan_label)
     print(_render(embed, scan_label=scan_label))
     if show_raw:
@@ -201,7 +272,16 @@ async def _run(args: argparse.Namespace) -> None:
                 f"(replaying from the saved payload for brief {message_id} - no Discord fetch needed)",
                 file=sys.stderr,
             )
-            await _replay_from_saved_payload(bot, payload_guild_id, payload, show_raw=args.raw)
+            logged_in = args.images
+            await _replay_from_saved_payload(
+                bot,
+                payload_guild_id,
+                payload,
+                show_raw=args.raw,
+                as_saved=args.as_saved,
+                with_images=args.images,
+                show_payload=args.show_payload,
+            )
             return
 
         print(
@@ -215,8 +295,9 @@ async def _run(args: argparse.Namespace) -> None:
     finally:
         if logged_in:
             await bot.close()
-        else:
-            await bot.memory_store.close()
+        # bot.close() doesn't close the store, and an open aiosqlite
+        # connection's worker thread keeps the process alive.
+        await bot.memory_store.close()
 
 
 def main() -> None:
@@ -233,6 +314,19 @@ def main() -> None:
         help="live-history fallback only: window size (default: DEFAULT_LIMIT)",
     )
     parser.add_argument("--raw", action="store_true", help="also print the model's raw JSON")
+    parser.add_argument(
+        "--as-saved",
+        action="store_true",
+        help="saved payload only: send it untouched, without recomputing the reporter fields",
+    )
+    parser.add_argument(
+        "--images",
+        action="store_true",
+        help="saved payload only: fetch (read-only) and send the images the live bot would pick",
+    )
+    parser.add_argument(
+        "--show-payload", action="store_true", help="print the exact payload sent to the model"
+    )
     args = parser.parse_args()
     try:
         asyncio.run(_run(args))
