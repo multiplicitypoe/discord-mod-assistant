@@ -97,7 +97,7 @@ async def test_a_moderator_who_acts_after_pressing_is_still_noticed(monkeypatch)
     view = IncidentView(payload(), memory_store=None, view_store=None)
     calls = []
 
-    async def collect(_interaction, since=None):
+    async def collect(_interaction, since=None, extra_target_user_ids=None):
         calls.append(since)
         if len(calls) < 3:
             return []
@@ -119,7 +119,7 @@ async def test_the_window_keeps_reaching_back_as_the_looks_go_on(monkeypatch):
     view = IncidentView(payload(), memory_store=None, view_store=None)
     seen = []
 
-    async def collect(_interaction, since=None):
+    async def collect(_interaction, since=None, extra_target_user_ids=None):
         seen.append(since)
         return []
 
@@ -134,7 +134,7 @@ async def test_finding_nothing_leaves_the_card_alone_and_says_so(caplog, monkeyp
     monkeypatch.setattr(iv, "_AUDIT_FOLLOW_UP_S", (0,))
     view = IncidentView(payload(), memory_store=None, view_store=None)
 
-    async def collect(_interaction, since=None):
+    async def collect(_interaction, since=None, extra_target_user_ids=None):
         return []
 
     monkeypatch.setattr(view, "_collect_recent_mod_actions", collect)
@@ -158,7 +158,7 @@ async def test_a_channel_reply_gets_superseded_by_a_later_real_action(monkeypatc
 
     action_calls = []
 
-    async def actions(_interaction, since=None):
+    async def actions(_interaction, since=None, extra_target_user_ids=None):
         action_calls.append(since)
         # 5 normal-schedule looks + 2 extra looks = 7 calls total. The real
         # action only ever shows up on the very last one.
@@ -187,7 +187,7 @@ async def test_extra_looks_are_skipped_once_a_real_action_is_already_shown(monke
     monkeypatch.setattr(iv, "_REPLY_EXTRA_FOLLOW_UP_S", (0, 0))
     view = IncidentView(payload(), memory_store=None, view_store=None)
 
-    async def actions(_interaction, since=None):
+    async def actions(_interaction, since=None, extra_target_user_ids=None):
         return ["Banned testuser1 · by Sable"]
 
     reply_calls = []
@@ -213,7 +213,7 @@ async def test_a_later_find_replaces_the_field_rather_than_stacking_a_second(mon
          "Banned testuser1 · by Sable"],
     ]
 
-    async def collect(_interaction, since=None):
+    async def collect(_interaction, since=None, extra_target_user_ids=None):
         return results.pop(0) if results else []
 
     monkeypatch.setattr(view, "_collect_recent_mod_actions", collect)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,48 @@ def _snowflake_created_at(snowflake_id: int) -> datetime:
     return datetime.fromtimestamp(
         ((snowflake_id >> 22) + _DISCORD_EPOCH_MS) / 1000, tz=timezone.utc
     )
+
+
+_PAREN_RE = re.compile(r"\([^)]*\)")
+
+
+def _line_key(line: str) -> str:
+    """The part of an evidence line that identifies the underlying fact,
+    with any parenthetical (a ban/kick/timeout reason, say) stripped out.
+
+    Two lines with the same key describe the same real-world event - the
+    parenthetical is enrichment, not a different fact - so a line gaining
+    one between looks (the audit log's reason field arriving, or simply
+    reading it once code learns to) must replace the plainer version
+    rather than sit alongside it as an apparent duplicate.
+    """
+    return re.sub(r"\s+", " ", _PAREN_RE.sub("", line)).strip()
+
+
+def merge_new_lines(previous: list[str], found: list[str]) -> tuple[list[str], bool]:
+    """Union two evidence line lists, order preserved, never shrinking.
+
+    A later audit-log or channel scan can come back with FEWER lines than an
+    earlier one found - a busy guild can push an old entry off a limited
+    audit-log page, and a moderator deleting the very message that explains
+    an incident is routine. Either way, what an earlier look already found
+    must survive a later look that doesn't happen to see it again.
+    """
+    merged = list(previous)
+    key_index = {_line_key(line): i for i, line in enumerate(merged)}
+    changed = False
+    for line in found:
+        key = _line_key(line)
+        existing_index = key_index.get(key)
+        if existing_index is not None:
+            if len(line) > len(merged[existing_index]):
+                merged[existing_index] = line
+                changed = True
+            continue
+        key_index[key] = len(merged)
+        merged.append(line)
+        changed = True
+    return merged, changed
 
 # Moderators often press Action Taken and then go and do the thing, so a single
 # look at the moment of the press is usually too early. Wait these many seconds
@@ -91,6 +134,20 @@ def _humanise_until(start, until) -> str:
     if seconds >= 60:
         return f"for {round(seconds / 60)}m"
     return f"for {seconds}s"
+
+
+def _entry_target(entry: Any) -> Any:
+    """entry.target, or None when discord.py cannot resolve it.
+
+    discord.py resolves .target by action number and raises TypeError
+    (Object(id=None)) for an action it does not know that carries no target id,
+    e.g. action 16 first seen 2026-10-01. getattr(..., None) only absorbs
+    AttributeError, so that one entry used to abort the whole scan.
+    """
+    try:
+        return entry.target
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True)
@@ -501,13 +558,21 @@ class IncidentView(discord.ui.View):
         """
         brief = getattr(message, "id", "?")
         since = self._audit_window_start()
+        presser_id = getattr(getattr(interaction, "user", None), "id", None)
+        extra_target_user_ids = {presser_id} if presser_id else None
         shown: list[str] = []
         shown_is_reply = False
         try:
             for wait_s in (0,) + tuple(_AUDIT_FOLLOW_UP_S):
                 if wait_s:
                     await asyncio.sleep(wait_s)
-                lines = await self._collect_recent_mod_actions(interaction, since=since)
+                # Whoever pressed Mark Handled is usually who acted, but not
+                # always via anything tied to this channel or these
+                # participants (a ban issued from the member list, say) -
+                # scanning their own audit-log activity too catches that.
+                lines = await self._collect_recent_mod_actions(
+                    interaction, since=since, extra_target_user_ids=extra_target_user_ids
+                )
                 is_reply = False
                 if not lines:
                     # No audit-log action doesn't mean nothing happened - often
@@ -517,9 +582,13 @@ class IncidentView(discord.ui.View):
                         interaction, since=since
                     )
                     is_reply = bool(lines)
-                if not lines or lines == shown:
+                # merge_new_lines rather than a plain replace: a later look
+                # can legitimately surface fewer lines than an earlier one
+                # (a busy guild pushing an old audit entry off the page),
+                # and what was already found must survive that.
+                shown, changed = merge_new_lines(shown, lines)
+                if not changed:
                     continue
-                shown = lines
                 shown_is_reply = is_reply
                 await self._show_action_summary(message, shown)
                 logger.info("Action summary for brief %s: %s", brief, "; ".join(shown))
@@ -529,6 +598,9 @@ class IncidentView(discord.ui.View):
                         "audit_summary",
                         outcome="; ".join(shown)[:500],
                     )
+                await self._trigger_evidence_refresh(
+                    interaction, message, extra_target_user_ids=extra_target_user_ids
+                )
 
             # A reply is provisional: a moderator can say "on it" before doing
             # the thing. Don't stop watching just because the normal schedule
@@ -537,10 +609,12 @@ class IncidentView(discord.ui.View):
             if shown_is_reply:
                 for wait_s in _REPLY_EXTRA_FOLLOW_UP_S:
                     await asyncio.sleep(wait_s)
-                    lines = await self._collect_recent_mod_actions(interaction, since=since)
-                    if not lines or lines == shown:
+                    lines = await self._collect_recent_mod_actions(
+                        interaction, since=since, extra_target_user_ids=extra_target_user_ids
+                    )
+                    shown, changed = merge_new_lines(shown, lines)
+                    if not changed:
                         continue
-                    shown = lines
                     await self._show_action_summary(message, shown)
                     logger.info(
                         "Action summary for brief %s upgraded past a channel reply: %s",
@@ -552,6 +626,9 @@ class IncidentView(discord.ui.View):
                             "audit_summary",
                             outcome="; ".join(shown)[:500],
                         )
+                    await self._trigger_evidence_refresh(
+                        interaction, message, extra_target_user_ids=extra_target_user_ids
+                    )
                     break
 
             if not shown:
@@ -565,6 +642,60 @@ class IncidentView(discord.ui.View):
             raise
         except Exception:
             logger.exception("Failed to attach the action summary")
+
+    async def _trigger_evidence_refresh(
+        self, interaction: Any, message: Any, *, extra_target_user_ids: set[int] | None
+    ) -> None:
+        """Recompute the brief itself, not just the Action-taken field.
+
+        The audit summary above only ever edits one field - it never told
+        the model what it found, so a brief could keep recommending action
+        against a reporter while the same card, one field down, showed a
+        moderator had already banned someone else entirely because of that
+        report. This reruns the analysis with that evidence included, and
+        replaces headline/summary/recommendations/draft with whatever it
+        produces. Best-effort: any failure here must not break the audit
+        summary that already landed successfully above it.
+        """
+        client = getattr(interaction, "client", None)
+        guild = getattr(interaction, "guild", None)
+        anchor_id = self.payload.anchor_message_id
+        source_channel_id = self.payload.source_channel_id
+        if client is None or guild is None or not anchor_id or not source_channel_id:
+            return
+        try:
+            channel = guild.get_channel(source_channel_id) or guild.get_thread(source_channel_id)
+            if channel is None:
+                channel = await guild.fetch_channel(source_channel_id)
+            anchor = await channel.fetch_message(int(anchor_id))
+            source_parent = channel.parent if isinstance(channel, discord.Thread) else channel
+            ping_author = (
+                anchor.author.display_name
+                if isinstance(anchor.author, discord.Member)
+                else str(anchor.author)
+            )
+            role_names = ", ".join(f"@{r.name}" for r in anchor.role_mentions) or "the modmail bot"
+            context = (
+                f"{ping_author} pinged {role_names} in #{getattr(source_parent, 'name', '?')}",
+                anchor.jump_url,
+            )
+            await client._refresh_incident_evidence(
+                message=message,
+                view=self,
+                anchor=anchor,
+                channel=channel,
+                guild=guild,
+                title="Auto Mod Brief",
+                context=context,
+                mod_role_id=self.payload.mod_role_id,
+                guild_id=guild.id,
+                ctx=f"mark_handled_refresh {getattr(message, 'id', '?')}",
+                extra_target_user_ids=extra_target_user_ids,
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+        except Exception:
+            logger.exception("Failed to trigger an evidence-driven brief refresh")
 
     async def _show_action_summary(self, message: Any, lines: list[str]) -> None:
         """Put the findings on the card.
@@ -586,7 +717,11 @@ class IncidentView(discord.ui.View):
         await fresh.edit(embed=embed, view=self)
 
     async def _collect_recent_mod_actions(
-        self, interaction: Any, since: datetime | None = None
+        self,
+        interaction: Any,
+        since: datetime | None = None,
+        *,
+        extra_target_user_ids: set[int] | None = None,
     ) -> list[str]:
         """Summarise audit log moderation against the people in this brief.
 
@@ -617,6 +752,10 @@ class IncidentView(discord.ui.View):
             participant_ids.add(pid)
             names[pid] = str(p.get("name") or pid)
         participant_ids.update(int(u) for u in self.selected_user_ids)
+        # e.g. whoever just pressed Mark Handled - worth scanning even when
+        # they're not a named participant, since they're often the one who
+        # quietly acted somewhere this brief never saw.
+        participant_ids.update(int(u) for u in (extra_target_user_ids or set()))
         after = since or self._audit_window_start()
         found: list[str] = []
         seen: set[tuple] = set()
@@ -640,7 +779,7 @@ class IncidentView(discord.ui.View):
                     continue
                 if int(where_id) != int(source_channel_id):
                     continue
-                raw = getattr(getattr(entry, "target", None), "id", None)
+                raw = getattr(_entry_target(entry), "id", None)
                 try:
                     participant_ids.add(int(raw))
                 except (TypeError, ValueError):
@@ -654,7 +793,7 @@ class IncidentView(discord.ui.View):
                 # such as 'AyewUQ6G' as their id, and an unguarded int() there
                 # aborted the whole scan, so the summary silently came back
                 # empty whenever an invite appeared in the window.
-                raw_target = getattr(getattr(entry, "target", None), "id", None)
+                raw_target = getattr(_entry_target(entry), "id", None)
                 try:
                     target_id = int(raw_target)
                 except (TypeError, ValueError):
@@ -668,24 +807,30 @@ class IncidentView(discord.ui.View):
                 )
                 # Someone pulled in from the audit log alone has no entry in the
                 # brief, so take whatever name the log itself carries.
-                target_obj = getattr(entry, "target", None)
+                target_obj = _entry_target(entry)
                 subject = names.get(target_id) or (
                     getattr(target_obj, "display_name", None)
                     or getattr(target_obj, "name", None)
                     or str(target_id)
                 )
                 action = entry.action
+                # Discord carries this on the entry itself - separate from
+                # anything the target ever posted, and often the only place
+                # the actual reason exists at all (e.g. "Suspicious or spam
+                # account" for an account with no message content to judge).
+                reason = (getattr(entry, "reason", None) or "").strip()
+                reason_suffix = f" ({reason})" if reason else ""
                 line = None
                 if action is discord.AuditLogAction.member_update:
                     until = getattr(getattr(entry, "after", None), "timed_out_until", None)
                     if until is not None:
-                        line = f"Timed out {subject} {_humanise_until(entry.created_at, until)}"
+                        line = f"Timed out {subject} {_humanise_until(entry.created_at, until)}{reason_suffix}"
                 elif action is discord.AuditLogAction.kick:
-                    line = f"Kicked {subject}"
+                    line = f"Kicked {subject}{reason_suffix}"
                 elif action is discord.AuditLogAction.ban:
-                    line = f"Banned {subject}"
+                    line = f"Banned {subject}{reason_suffix}"
                 elif action is discord.AuditLogAction.unban:
-                    line = f"Unbanned {subject}"
+                    line = f"Unbanned {subject}{reason_suffix}"
                 elif action in (
                     discord.AuditLogAction.message_delete,
                     discord.AuditLogAction.message_bulk_delete,

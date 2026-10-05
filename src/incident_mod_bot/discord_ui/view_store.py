@@ -93,6 +93,25 @@ class ViewStore:
             )
         return records
 
+    async def load_view(self, message_id: int) -> ViewRecord | None:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT message_id, channel_id, guild_id, payload_json, created_at "
+            "FROM incident_views WHERE message_id = ?",
+            (message_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        return ViewRecord(
+            message_id=row["message_id"],
+            channel_id=row["channel_id"],
+            guild_id=row["guild_id"],
+            payload=json.loads(row["payload_json"]),
+            created_at=row["created_at"],
+        )
+
     async def delete_view(self, message_id: int) -> None:
         conn = self._require_conn()
         await conn.execute("DELETE FROM incident_views WHERE message_id = ?", (message_id,))

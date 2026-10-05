@@ -22,8 +22,35 @@ class OpenAISettings:
     debug_logs: bool = False
 
 
+# The SDK default is 600s and two retries, so one request that never answers
+# holds a brief (or a replay) for half an hour. A normal analysis, images
+# included, answers in under 15s.
+_REQUEST_TIMEOUT_S = 90.0
+_MAX_RETRIES = 1
+
+
 def create_client(api_key: str) -> OpenAI:
-    return OpenAI(api_key=api_key)
+    return OpenAI(api_key=api_key, timeout=_REQUEST_TIMEOUT_S, max_retries=_MAX_RETRIES)
+
+
+# Reasoning models reject temperature, and count their hidden reasoning
+# against max_output_tokens - at a budget sized for the visible JSON they
+# can spend it all thinking and return nothing.
+_REASONING_MODEL_PREFIXES = ("gpt-5", "gpt-6", "o1", "o3", "o4")
+_REASONING_HEADROOM_TOKENS = 4000
+
+
+def _is_reasoning_model(model: str) -> bool:
+    return model.startswith(_REASONING_MODEL_PREFIXES) and "chat" not in model
+
+
+def _sampling(model: str, *, temperature: float, max_output_tokens: int) -> dict[str, Any]:
+    if _is_reasoning_model(model):
+        return {
+            "reasoning": {"effort": "low"},
+            "max_output_tokens": max_output_tokens + _REASONING_HEADROOM_TOKENS,
+        }
+    return {"temperature": temperature, "max_output_tokens": max_output_tokens}
 
 
 def _log_usage(settings: OpenAISettings, response: Any, purpose: str) -> None:
@@ -131,9 +158,8 @@ def summarize_rules(client: OpenAI, settings: OpenAISettings, rules_text: str) -
     response = responses.create(
         model=settings.model,
         input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-        temperature=0.2,
         text={"format": {"type": "json_object"}},
-        max_output_tokens=800,
+        **_sampling(settings.model, temperature=0.2, max_output_tokens=800),
     )
     _log_usage(settings, response, purpose="summarize_rules")
     text = _response_text(response)
@@ -178,9 +204,8 @@ def summarize_images(
     response = responses.create(
         model=settings.model,
         input=[{"role": "user", "content": content}],
-        temperature=0.2,
         text={"format": {"type": "json_object"}},
-        max_output_tokens=600,
+        **_sampling(settings.model, temperature=0.2, max_output_tokens=600),
     )
     _log_usage(settings, response, purpose="summarize_images")
     text = _response_text(response)
@@ -213,6 +238,7 @@ def analyze_incident(
     client: OpenAI,
     settings: OpenAISettings,
     payload: dict[str, Any],
+    images: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     prompt = (
         "You are a Discord moderation assistant. Your job is to help a busy mod catch up fast. "
@@ -224,8 +250,93 @@ def analyze_incident(
         "If evidence is weak, say so plainly and suggest a neutral check-in.\n\n"
         "If payload includes anchor_message_id, focus the brief around that message "
         "(what led up to it and what happened right after).\n\n"
+        "Each message may carry t (seconds relative to the anchor, negative = before) and "
+        "reply_to (the id of the message it replies to). Use them to tell who is answering "
+        "whom, and whether something is part of the same exchange or minutes apart.\n"
+        "attachments lists files a message carried (name, and size for images). image_ids "
+        "name images that follow this prompt, each introduced by 'Image id: <id>'. Read an "
+        "image as part of its message: a screenshot of someone's roles, a meme aimed at a "
+        "person, or proof of a scam can be the whole point of an otherwise short line. "
+        "A message with attachments but no image_ids carried a file you were not shown; do "
+        "not guess what it showed.\n"
+        "payload.authors maps author_id to facts about that account as of the anchor: "
+        "account_age_days, joined_server_days (when known), mod (true for moderators), "
+        "discord_spammer_flag (Discord itself has flagged the account as a likely spammer). "
+        "An account days old, or that joined the server hours ago, posting DM bait ('dms "
+        "open', 'looking for friends', 'bored, message me'), links, or offers is the usual "
+        "shape of a scam or spam bot: say so in the headline, and prefer removing the post "
+        "and banning over a warning - unless audit_findings shows that already happened, "
+        "which is [\\\"Already handled.\\\"] as below. discord_spammer_flag makes that near-certain. Age alone "
+        "is never evidence of wrongdoing - new players have new accounts - so never hold it "
+        "against someone whose messages are otherwise fine. A mod's messages are moderation "
+        "or chat, not an incident, unless they clearly break a rule themselves.\n\n"
+        "If payload includes reporter, that person sent the ping at anchor_message_id: they "
+        "are asking moderators for help, and the brief is mainly about who and what they are "
+        "reporting.\n"
+        "  reporter.replied_to_message_id, present when the ping was sent as a Discord reply, "
+        "IS the reported message: replying is how the reporter pointed at it. "
+        "reporter.reported_message repeats its author and text. Judge that message and its "
+        "author, and name that author in the summary. Never swap in a neighbouring message: "
+        "whatever was posted between it and the ping, however recent or however close in "
+        "wording, is not what was reported. Use the messages around it only as context "
+        "(what it answered, who it was about).\n"
+        "  The reporter's own messages right around the ping are the report itself, often "
+        "split across lines ('mods' / '@Chat Moderator' / 'kill him'). Gamer slang for "
+        "'please ban this person' often sounds violent - 'mods, kill him', 'end him', 'crush "
+        "his skull'. It is never a threat and never evidence against the reporter.\n"
+        "  reporter.likely_reported_message_id, present only when the ping was bare (no text of "
+        "its own) and not a reply, is the last message before the "
+        "ping from anyone other than the reporter - usually what they are reporting. Start "
+        "there: judge that message and its author against the rules on their own merits. "
+        "Move off it only if the reporter's own words point at someone or something else.\n"
+        "  The reporter's own conduct is in scope too. Read their messages before and after "
+        "the ping. If they bait or mock other users or the moderators ('do your job', "
+        "'ban me already or do your jobs'), say they are trolling "
+        "or want to be banned, provoked the very message they reported, or use the ping "
+        "itself as a taunt or a prop, say so plainly in reporter_note: their name and a "
+        "short quote. Report slang like 'mods, kill him' is a report, not conduct, and "
+        "earns no reporter_note.\n"
+        "  reporter.recent_pings, when present, lists this person's earlier mod pings: how "
+        "many, how many hours before this one, who they replied to, and what each brief "
+        "said when a moderator closed it ('not marked handled' if nobody has). A run of "
+        "pings close together, or pings that each answer someone needling them, is a "
+        "pattern: mention it in reporter_note in a few words. One earlier ping days ago "
+        "is not a pattern.\n"
+        "  You never decide a punishment for the reporter. Never recommend a ban, timeout, "
+        "warning, infraction or role removal against them for pinging, baiting or the "
+        "pattern. When their conduct matters, recommendations may say to check the "
+        "reporter's own recent messages or to review the repeated pings, and leave the "
+        "call to the moderators. The reported message is still judged on its own merits.\n"
+        "  A bare ping, '^', 'mods', 'get em', 'kill him', 'delete this' are all reports. "
+        "The one exception is a ping whose own text asks moderators a question about "
+        "something other than a person ('worth an announcement?', 'can you pin this'): "
+        "that reports no one, so say what they asked and do not search the window for "
+        "someone to blame.\n"
+        "  Messages other people post after the ping (memes, gifs, 'lol mods') are reactions "
+        "to the ping, not the incident; never make them the subject.\n"
+        "  Only make the reporter the subject if, before the ping, they themselves clearly "
+        "broke a rule (e.g. abusing someone).\n\n"
+        "If payload includes audit_findings, it lists moderation actions Discord's own "
+        "audit log shows already happened for people in this incident (bans, kicks, "
+        "timeouts, message deletions) - not something inferred from message text, ground "
+        "truth about what a moderator actually did. Weigh it above any guess made from "
+        "messages alone, especially when messages carry little or no explanation. "
+        "If it shows real enforcement action against the person this brief is about - for a "
+        "ping, the person reported, never the reporter - the violation was real and a "
+        "moderator already acted on it. Set recommendations to [\\\"Already handled.\\\"], "
+        "never [\\\"No action.\\\"] - 'No action' reads as 'not a violation', which is wrong "
+        "when rule_refs on the same card says otherwise. Do not restate what was done; "
+        "audit_findings already renders it one field down.\n"
+        "  Enforcement against the person reported also shows the ping was a legitimate "
+        "report: never recommend action against the reporter because of it.\n"
+        "  [\\\"No action.\\\"] is only for when nobody in the incident broke a rule.\n"
+        "  audit_findings is rendered to the moderator as its own separate list beneath "
+        "this brief - do not restate what it already says (who was banned/kicked/timed "
+        "out/had a message deleted) in headline or summary; say only what the underlying "
+        "behavior was that led to it. 'Posted a scam link' is right; 'posted a scam link "
+        "and was banned for it' repeats what the moderator can already see one field down.\n\n"
         "Return JSON only with keys: headline, summary, participants, signals, rule_refs, "
-        "recommendations, draft_message, reply_targets, draft_replies, confidence, evidence_quotes, memory_suggestions.\n\n"
+        "recommendations, draft_message, reply_targets, draft_replies, confidence, evidence_quotes, memory_suggestions, reporter_note.\n\n"
         "Hard limits (keep it tight):\n"
         "- headline: <= 70 chars. What happened, in the words a moderator would use. "
         "e.g. 'RMT link in trade chat', 'Begging in LFG', 'Heated argument in offtopic'. "
@@ -239,6 +350,10 @@ def analyze_incident(
         "describe the channel being normal beforehand unless that actually matters. "
         "Do not use bold: it is rendered after a bold label and more bold would "
         "compete with it.\n"
+        "  Name people by author_name. Every action has its actor: 'user_c joked about "
+        "removing gen perms', never 'Suggested removing...' or 'A user said...'. Never "
+        "write 'the reported message' without naming whose it is, and never credit one "
+        "person's words to another, least of all to the reporter.\n"
         "  Say what happened, never the current state. No 'it is still up', 'nobody has "
         "replied', 'this is unhandled'. What happened stays true; status is usually "
         "stale by the time anyone reads it, and a stale status is worse than none.\n"
@@ -246,6 +361,16 @@ def analyze_incident(
         "reselling site', not 'shared something suspicious'. A vaguer word than the "
         "thing itself is always wrong, because the moderator has to go and look to "
         "find out what you meant.\n"
+        "  When audit_findings is present, this sentence ends the moment you have "
+        "described the behavior - never continue into what happened to the person "
+        "afterward, in any wording (banned, kicked, timed out, removed, deleted, "
+        "'moderation stepped in', 'leading to a ban', 'and was dealt with', or any "
+        "other paraphrase of an enforcement outcome). That outcome is rendered as "
+        "its own list right below this text; saying it again in prose, in any form, "
+        "wastes the line exactly the way repeating the recommended action would. "
+        "Right: 'Posted a crypto scam link.' Wrong, all three: 'Posted a crypto "
+        "scam link and was banned for it.' / '...link, leading to a ban.' / "
+        "'...link; the account was removed.'\n"
         "- participants: <= 4\n"
         "- signals: <= 4\n"
         "- rule_refs: <= 2\n"
@@ -257,7 +382,7 @@ def analyze_incident(
         "- evidence_quotes: <= 2; each quote <= 140 chars. Quote only the offending "
         "content itself, the message(s) that show the violation, never a bystander "
         "reaction, a ping for a moderator, or commentary around it.\n"
-        "- draft_message: if recommendations is exactly [\\\"No action.\\\"], set draft_message to empty string and reply_targets to [].\n"
+        "- draft_message: if recommendations is exactly [\\\"No action.\\\"] or [\\\"Already handled.\\\"], set draft_message to empty string and reply_targets to [].\n"
         "- Otherwise, draft_message <= 350 chars, 1-3 sentences; sound like a mod, not a chatbot.\n"
         "  Avoid corporate/mod-bot phrasing like: 'to maintain a positive environment', 'friendly reminder', 'we appreciate', 'come across as', 'toxic'.\n"
         "  Use 'please' and keep it calm/empathetic.\n"
@@ -270,31 +395,47 @@ def analyze_incident(
         "- draft_replies: optional; use only if you want different copy per target (<= 3 lines).\n"
         "- confidence: number between 0 and 1\n"
         "- memory_suggestions: only when moderation-relevant; if no action, keep both lists empty\n\n"
-        "If recommendations is exactly [\\\"No action.\\\"], be extra compact:\n"
+        "If recommendations is exactly [\\\"No action.\\\"] or [\\\"Already handled.\\\"], be extra compact:\n"
         "- participants: <= 3\n"
         "- signals: <= 3\n"
-        "- evidence_quotes: <= 2\n"
+        "- evidence_quotes: 1-2 quoting the offending message when it is in the window "
+        "(the moderator reads it to confirm what was acted on), otherwise []\n"
         "- memory_suggestions.server_notes: []\n"
         "- memory_suggestions.user_notes: []\n\n"
         "Participants entries: {user_id, name, role, notes} (notes optional, <= 60 chars).\n"
         "Reply targets: [{user_id, message_id}].\n"
         "Draft replies: [{user_id, text}] where text is what comes after the ping.\n"
-        "Evidence quotes entries: {quote, message_id} where message_id is from payload.messages[].id. Do not output URLs.\n"
+        "Evidence quotes entries: {quote, message_id} where message_id is from payload.messages[].id. Never make up a URL, but when the "
+        "offending message is itself a link, quote the link - a card with no evidence is "
+        "worse than one that quotes a URL.\n"
         "Rule refs entries: {id, reason}.\n"
         "Memory suggestions: {server_notes: [str], user_notes: [{user_id, label, evidence_message_id}]}.\n"
         "Only suggest user_notes if the behavior appears more than once or is clearly habitual.\n"
+        "reporter_note: string, <= 200 chars, about the reporter's own conduct and any "
+        "repeat-ping pattern as described above; empty string when there is nothing worth "
+        "a moderator's time or no reporter. It is shown on its own line, so never repeat "
+        "the summary in it, and never put a punishment in it.\n"
         "Use the provided user_id values.\n"
         "IDs can be long. Treat user_id and message_id as opaque identifiers and copy digits exactly from the payload; never guess or alter IDs. If you cannot provide a valid ID, use null or omit that field.\n\n"
         "Payload:\n"
         + json.dumps(payload, ensure_ascii=True)
     )
+    content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    for image in images or []:
+        content.append({"type": "input_text", "text": f"Image id: {image['id']}"})
+        content.append(
+            {
+                "type": "input_image",
+                "image_url": image["data_url"],
+                "detail": image.get("detail") or settings.image_detail,
+            }
+        )
     responses = getattr(client, "responses")
     response = responses.create(
         model=settings.model,
-        input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-        temperature=0.0,
+        input=[{"role": "user", "content": content}],
         text={"format": {"type": "json_object"}},
-        max_output_tokens=900,
+        **_sampling(settings.model, temperature=0.0, max_output_tokens=900),
     )
     _log_usage(settings, response, purpose="analyze_incident")
     text = _response_text(response)
@@ -319,7 +460,10 @@ def refine_incident_with_images(
         "Write like a competent human mod: terse, direct, no filler, no 'AI voice'. No emojis.\n"
         "Output ASCII only. No emojis or special symbols.\n\n"
         "Return JSON only with keys: headline, summary, participants, signals, rule_refs, "
-        "recommendations, draft_message, reply_targets, draft_replies, confidence, evidence_quotes, memory_suggestions.\n\n"
+        "recommendations, draft_message, reply_targets, draft_replies, confidence, evidence_quotes, memory_suggestions, reporter_note.\n"
+        "Keep the base result's reported message, the people it names and its reporter_note "
+        "unless an image shows they are wrong. Name people by author_name; every action "
+        "has its actor. Never add a punishment for whoever pinged.\n\n"
         "Hard limits (keep it tight):\n"
         "- headline: <= 70 chars. What happened, in the words a moderator would use. "
         "e.g. 'RMT link in trade chat', 'Begging in LFG', 'Heated argument in offtopic'. "
@@ -351,7 +495,7 @@ def refine_incident_with_images(
         "- evidence_quotes: <= 2; each quote <= 140 chars. Quote only the offending "
         "content itself, the message(s) that show the violation, never a bystander "
         "reaction, a ping for a moderator, or commentary around it.\n"
-        "- draft_message: if recommendations is exactly [\\\"No action.\\\"], set draft_message to empty string and reply_targets to [].\n"
+        "- draft_message: if recommendations is exactly [\\\"No action.\\\"] or [\\\"Already handled.\\\"], set draft_message to empty string and reply_targets to [].\n"
         "- reply_targets: <= 3; if you want a public reply, set 1-3 targets.\n"
         "- draft_replies: optional; use only if you want different copy per target (<= 3 lines).\n"
         "- draft_message otherwise: <= 350 chars, 1-3 sentences; sound like a mod, not a chatbot.\n"
@@ -363,10 +507,11 @@ def refine_incident_with_images(
         "  Do not include @mentions in draft_message or draft_replies (we will add pings).\n"
         "- confidence: number between 0 and 1\n\n"
 
-        "If recommendations is exactly [\\\"No action.\\\"], be extra compact:\n"
+        "If recommendations is exactly [\\\"No action.\\\"] or [\\\"Already handled.\\\"], be extra compact:\n"
         "- participants: <= 3\n"
         "- signals: <= 3\n"
-        "- evidence_quotes: <= 2\n"
+        "- evidence_quotes: 1-2 quoting the offending message when it is in the window "
+        "(the moderator reads it to confirm what was acted on), otherwise []\n"
         "- memory_suggestions.server_notes: []\n"
         "- memory_suggestions.user_notes: []\n\n"
         "Reply targets: [{user_id, message_id}]. If exactly one target, set message_id to the specific message to reply to. If >1 targets, set message_id to null.\n"
@@ -383,12 +528,11 @@ def refine_incident_with_images(
     response = responses.create(
         model=settings.model,
         input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-        temperature=0.0,
         text={"format": {"type": "json_object"}},
         # Must exceed analyze_incident's budget (900): this step consumes that
         # result and returns a superset of it. At 650 it truncated mid-JSON
         # ("Unterminated string" at ~2300 chars) and the refinement was lost.
-        max_output_tokens=1200,
+        **_sampling(settings.model, temperature=0.0, max_output_tokens=1200),
     )
     _log_usage(settings, response, purpose="refine_incident_with_images")
     text = _response_text(response)
