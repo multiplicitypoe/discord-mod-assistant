@@ -757,6 +757,18 @@ class IncidentView(discord.ui.View):
         # quietly acted somewhere this brief never saw.
         participant_ids.update(int(u) for u in (extra_target_user_ids or set()))
         after = since or self._audit_window_start()
+        # Everyone who spoke in the window the brief was built from. A moderator
+        # often bans the person the brief failed to name (the reporter said
+        # "likely bot in chat" and the brief could not tell which), so being in
+        # the conversation counts - but only for what happened after the
+        # incident started, not for the lookback before it.
+        window_ids = await self._window_author_ids(interaction)
+        window_ids -= participant_ids
+        incident_start = (
+            _snowflake_created_at(self.payload.anchor_message_id)
+            if self.payload.anchor_message_id
+            else after
+        )
         found: list[str] = []
         seen: set[tuple] = set()
         try:
@@ -799,7 +811,8 @@ class IncidentView(discord.ui.View):
                 except (TypeError, ValueError):
                     continue
                 if target_id not in participant_ids:
-                    continue
+                    if target_id not in window_ids or entry.created_at < incident_start:
+                        continue
                 who = (
                     getattr(entry.user, "display_name", None)
                     or getattr(entry.user, "name", None)
@@ -864,6 +877,34 @@ class IncidentView(discord.ui.View):
             logger.exception("Failed to read audit log for action summary")
             return []
         return found
+
+    async def _window_author_ids(self, interaction: Any) -> set[int]:
+        """Ids of everyone who posted in the window this brief was analysed on.
+
+        Read from the saved analysis payload; empty when it is missing."""
+        store = self.memory_store
+        brief_id = getattr(getattr(interaction, "message", None), "id", None)
+        if store is None or not brief_id:
+            return set()
+        try:
+            found = await store.get_incident_payload(int(brief_id))
+        except Exception:
+            logger.exception("Could not load the saved payload for the action summary")
+            return set()
+        if not found:
+            return set()
+        payload = found[1]
+        raw: list[Any] = [m.get("author_id") for m in payload.get("messages") or [] if isinstance(m, dict)]
+        authors = payload.get("authors")
+        if isinstance(authors, dict):
+            raw.extend(authors.keys())
+        ids: set[int] = set()
+        for value in raw:
+            try:
+                ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return ids
 
     async def _collect_recent_mod_channel_replies(
         self, interaction: Any, since: datetime | None = None
