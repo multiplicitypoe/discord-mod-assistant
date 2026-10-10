@@ -7,6 +7,7 @@ so the live trigger, the follow-up refresh and replay.py all agree.
 """
 from __future__ import annotations
 
+import re
 from collections import Counter
 from typing import Any
 
@@ -20,6 +21,22 @@ PING_HISTORY_MAX_LISTED = 5
 # Messages either side of the ping whose images can reach the analysis pass.
 IMAGE_NEIGHBOURS_BEFORE = 6
 IMAGE_NEIGHBOURS_AFTER = 3
+
+# The reporter's own words right after the ping are part of the report.
+FOLLOWUP_MAX = 3
+FOLLOWUP_WITHIN_MS = 10 * 60 * 1000
+FOLLOWUP_WITHIN_MESSAGES = 25
+
+# Other members voicing suspicion ("same prompt ahh bot"), with the message each is about.
+CALLOUT_MAX = 5
+CALLOUT_TEXT_MAX = 100
+_CALLOUT_RE = re.compile(
+    r"\b(?:bots?|botted|sus|sussy|suspicious|scams?|scammers?|scammy|spam|spams|spammer|spammers|"
+    r"spamming|spammy|fake|catfish|phish\w*|chat ?gpt|gpt|ai|prompt|hacked|compromised)\b",
+    re.IGNORECASE,
+)
+_MENTION_ONLY_RE = re.compile(r"(?:@[\w\-]+(?: [\w\-]+)*\s*)+")
+_URL_ONLY_RE = re.compile(r"(?:https?://\S+\s*)+")
 
 
 def snowflake_ms(snowflake: int) -> int:
@@ -43,7 +60,7 @@ def excerpt(message: dict[str, Any], *, max_len: int = 200) -> dict[str, Any]:
     return out
 
 
-def reported_message_pointer(
+def _reported_pointer(
     reporter: dict[str, Any], messages: list[dict[str, Any]], anchor_message_id: int | None
 ) -> dict[str, Any]:
     """The reporter dict with a pointer to the message the ping is about.
@@ -64,7 +81,14 @@ def reported_message_pointer(
     out = {
         k: v
         for k, v in reporter.items()
-        if k not in ("likely_reported_message_id", "replied_to_message_id", "reported_message")
+        if k not in (
+            "likely_reported_message_id",
+            "likely_reported_message",
+            "replied_to_message_id",
+            "reported_message",
+            "followup_text",
+            "callouts",
+        )
     }
     if anchor_message_id is None:
         return out
@@ -91,8 +115,117 @@ def reported_message_pointer(
     ]
     if before:
         last = max(before, key=lambda m: m["id"])
+        # A guess, not a report: it must not carry the authority a reply target does
+        # (reported_message), or the model defends it against the reporter's own words.
         out["likely_reported_message_id"] = last["id"]
-        out["reported_message"] = excerpt(last)
+        out["likely_reported_message"] = excerpt(last)
+    return out
+
+
+def _clip(text: str, n: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def reporter_followup_text(
+    messages: list[dict[str, Any]], reporter_id: Any, anchor_message_id: int
+) -> list[dict[str, Any]]:
+    """What the reporter wrote right after the ping, e.g. "likely bot in chat".
+
+    That text is part of the report and can name the subject, which a bare
+    ping alone never does. Only their own messages, shortly after the ping.
+    """
+    if reporter_id is None:
+        return []
+    anchor_ms = snowflake_ms(anchor_message_id)
+    after = sorted(
+        (m for m in messages if isinstance(m.get("id"), int) and m["id"] > anchor_message_id),
+        key=lambda m: m["id"],
+    )[:FOLLOWUP_WITHIN_MESSAGES]
+    out: list[dict[str, Any]] = []
+    for m in after:
+        if snowflake_ms(m["id"]) - anchor_ms > FOLLOWUP_WITHIN_MS:
+            break
+        if m.get("author_id") != reporter_id:
+            continue
+        text = str(m.get("content") or "").strip()
+        if not text or _MENTION_ONLY_RE.fullmatch(text):
+            continue
+        out.append({"id": m["id"], "text": _clip(text, 200)})
+        if len(out) >= FOLLOWUP_MAX:
+            break
+    return out
+
+
+def _has_words(message: dict[str, Any]) -> bool:
+    text = str(message.get("content") or "").strip()
+    return bool(text) and not _URL_ONLY_RE.fullmatch(text)
+
+
+def bystander_callouts(
+    messages: list[dict[str, Any]], reporter_id: Any
+) -> list[dict[str, Any]]:
+    """Other members voicing suspicion, with the message each one is about.
+
+    "same prompt ahh bot" is about the message above it, not the one nearest
+    the mod ping 30 messages later. A reply names its target; otherwise it is
+    the previous message with words in it from someone else. These are hints
+    for the model, never facts.
+    """
+    ordered = sorted((m for m in messages if isinstance(m.get("id"), int)), key=lambda m: m["id"])
+    by_id = {m["id"]: m for m in ordered}
+    grouped: dict[int, dict[str, Any]] = {}
+    for i, m in enumerate(ordered):
+        if m.get("author_id") == reporter_id:
+            continue
+        text = str(m.get("content") or "")
+        if not _CALLOUT_RE.search(text):
+            continue
+        about = None
+        ref = m.get("reply_to")
+        if isinstance(ref, int) and ref in by_id and by_id[ref].get("author_id") != m.get("author_id"):
+            about = by_id[ref]
+        else:
+            for prev in reversed(ordered[:i]):
+                if prev.get("author_id") != m.get("author_id") and _has_words(prev):
+                    about = prev
+                    break
+        if about is None:
+            continue
+        entry = grouped.setdefault(
+            about["id"],
+            {
+                "about_message_id": about["id"],
+                "about_author": about.get("author_name"),
+                "about_text": _clip(str(about.get("content") or ""), CALLOUT_TEXT_MAX),
+                "said": [],
+            },
+        )
+        if len(entry["said"]) < 3:
+            entry["said"].append({"by": m.get("author_name"), "text": _clip(text, CALLOUT_TEXT_MAX)})
+    return list(grouped.values())[-CALLOUT_MAX:]
+
+
+def reported_message_pointer(
+    reporter: dict[str, Any], messages: list[dict[str, Any]], anchor_message_id: int | None
+) -> dict[str, Any]:
+    """The reporter dict, with what the ping points at and what was said about it.
+
+    A reply-ping points at its reply target (authoritative). A bare ping gets
+    only a low-authority guess (the last message before it) plus the
+    reporter's own follow-up text and any bystander callouts, so that
+    "likely bot in chat" can move the model off the guess. Everything is
+    recomputed, never carried over from a stored payload.
+    """
+    out = _reported_pointer(reporter, messages, anchor_message_id)
+    if anchor_message_id is None:
+        return out
+    followup = reporter_followup_text(messages, out.get("user_id"), anchor_message_id)
+    if followup:
+        out["followup_text"] = followup
+    callouts = bystander_callouts(messages, out.get("user_id"))
+    if callouts:
+        out["callouts"] = callouts
     return out
 
 
