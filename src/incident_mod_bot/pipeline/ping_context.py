@@ -29,12 +29,17 @@ FOLLOWUP_WITHIN_MESSAGES = 25
 
 # Other members voicing suspicion ("same prompt ahh bot"), with the message each is about.
 CALLOUT_MAX = 5
+CALLOUT_ABOVE = 4
 CALLOUT_TEXT_MAX = 100
 _CALLOUT_RE = re.compile(
     r"\b(?:bots?|botted|sus|sussy|suspicious|scams?|scammers?|scammy|spam|spams|spammer|spammers|"
     r"spamming|spammy|fake|catfish|phish\w*|chat ?gpt|gpt|ai|prompt|hacked|compromised)\b",
     re.IGNORECASE,
 )
+# One member posting the same thing again and again in a few seconds.
+REPEAT_WITHIN_MS = 30 * 1000
+REPEAT_MIN = 3
+REPEAT_MAX_LISTED = 3
 _MENTION_ONLY_RE = re.compile(r"(?:@[\w\-]+(?: [\w\-]+)*\s*)+")
 _URL_ONLY_RE = re.compile(r"(?:https?://\S+\s*)+")
 
@@ -88,6 +93,7 @@ def _reported_pointer(
             "reported_message",
             "followup_text",
             "callouts",
+            "repeat_posts",
         )
     }
     if anchor_message_id is None:
@@ -162,48 +168,119 @@ def _has_words(message: dict[str, Any]) -> bool:
     return bool(text) and not _URL_ONLY_RE.fullmatch(text)
 
 
+def _gist(message: dict[str, Any]) -> str:
+    """What a message looks like in a list: its words, or that it was an image."""
+    text = str(message.get("content") or "").strip()
+    if text:
+        return _clip(text, CALLOUT_TEXT_MAX)
+    return "[attachment]" if message.get("attachments") else "[empty]"
+
+
 def bystander_callouts(
     messages: list[dict[str, Any]], reporter_id: Any
 ) -> list[dict[str, Any]]:
-    """Other members voicing suspicion, with the message each one is about.
+    """Other members voicing suspicion, and what they were talking about.
 
-    "same prompt ahh bot" is about the message above it, not the one nearest
-    the mod ping 30 messages later. A reply names its target; otherwise it is
-    the previous message with words in it from someone else. These are hints
-    for the model, never facts.
+    "same prompt ahh bot" is about a message above it, not the one nearest
+    the mod ping 30 messages later. A reply names its target. Anything else
+    could be about any of the last few messages, including an image with no
+    words ("stop spamming it" after three screenshots), so those list what
+    was just above instead of picking one. These are hints for the model,
+    never facts.
     """
     ordered = sorted((m for m in messages if isinstance(m.get("id"), int)), key=lambda m: m["id"])
     by_id = {m["id"]: m for m in ordered}
-    grouped: dict[int, dict[str, Any]] = {}
+    grouped: dict[Any, dict[str, Any]] = {}
     for i, m in enumerate(ordered):
         if m.get("author_id") == reporter_id:
             continue
         text = str(m.get("content") or "")
         if not _CALLOUT_RE.search(text):
             continue
-        about = None
+        said = {"by": m.get("author_name"), "text": _clip(text, CALLOUT_TEXT_MAX)}
         ref = m.get("reply_to")
         if isinstance(ref, int) and ref in by_id and by_id[ref].get("author_id") != m.get("author_id"):
             about = by_id[ref]
-        else:
-            for prev in reversed(ordered[:i]):
-                if prev.get("author_id") != m.get("author_id") and _has_words(prev):
-                    about = prev
-                    break
-        if about is None:
+            entry = grouped.setdefault(
+                about["id"],
+                {
+                    "about_message_id": about["id"],
+                    "about_author": about.get("author_name"),
+                    "about_text": _gist(about),
+                    "said": [],
+                },
+            )
+            if len(entry["said"]) < 3:
+                entry["said"].append(said)
             continue
-        entry = grouped.setdefault(
-            about["id"],
-            {
-                "about_message_id": about["id"],
-                "about_author": about.get("author_name"),
-                "about_text": _clip(str(about.get("content") or ""), CALLOUT_TEXT_MAX),
-                "said": [],
-            },
-        )
-        if len(entry["said"]) < 3:
-            entry["said"].append({"by": m.get("author_name"), "text": _clip(text, CALLOUT_TEXT_MAX)})
+        above = [
+            {"id": prev["id"], "author": prev.get("author_name"), "text": _gist(prev)}
+            for prev in reversed(ordered[:i])
+            if prev.get("author_id") != m.get("author_id")
+        ][:CALLOUT_ABOVE]
+        if not above:
+            continue
+        grouped[("nr", m["id"])] = {"said": [said], "not_a_reply_so_about_one_of": above}
     return list(grouped.values())[-CALLOUT_MAX:]
+
+
+def _attachment_key(message: dict[str, Any]) -> str | None:
+    raw = message.get("attachments")
+    if not raw:
+        return None
+    items = raw if isinstance(raw, list) else [raw]
+    return "|".join(sorted(str(i) for i in items))
+
+
+def repeat_posts(messages: list[dict[str, Any]], reporter_id: Any) -> list[dict[str, Any]]:
+    """Members who posted the same thing several times within seconds.
+
+    Three attachments of the same size and name in six seconds is one
+    screenshot posted three times. The text pass cannot see the images, and
+    an image-only message has no words to give it away, so this says so in
+    plain data. Identical text counts too. A signal, not a verdict.
+    """
+    ordered = sorted((m for m in messages if isinstance(m.get("id"), int)), key=lambda m: m["id"])
+    by_author: dict[Any, list[dict[str, Any]]] = {}
+    for m in ordered:
+        if m.get("author_id") is None or m.get("author_id") == reporter_id:
+            continue
+        by_author.setdefault(m["author_id"], []).append(m)
+    found: list[dict[str, Any]] = []
+    for author_id, posts in by_author.items():
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for m in posts:
+            key = _attachment_key(m)
+            if key:
+                groups.setdefault(("attachment", key), []).append(m)
+            text = str(m.get("content") or "").strip().lower()
+            if len(text) >= 4:
+                groups.setdefault(("text", text), []).append(m)
+        for (kind, what), group in groups.items():
+            if len(group) < REPEAT_MIN:
+                continue
+            # The tightest run of REPEAT_MIN or more inside the time limit.
+            run: list[dict[str, Any]] = []
+            for m in group:
+                run = [r for r in run if snowflake_ms(m["id"]) - snowflake_ms(r["id"]) <= REPEAT_WITHIN_MS]
+                run.append(m)
+                if len(run) >= REPEAT_MIN:
+                    break
+            if len(run) < REPEAT_MIN:
+                continue
+            span_ms = snowflake_ms(run[-1]["id"]) - snowflake_ms(run[0]["id"])
+            found.append(
+                {
+                    "author_id": author_id,
+                    "author_name": run[0].get("author_name"),
+                    "times": len(group),
+                    "within_seconds": round(span_ms / 1000),
+                    "same": ("the same attachment: " + what) if kind == "attachment" else "the same text: " + _clip(what, 60),
+                    "message_ids": [r["id"] for r in group][:6],
+                }
+            )
+    found.sort(key=lambda f: f["message_ids"][-1])
+    return found[-REPEAT_MAX_LISTED:]
 
 
 def reported_message_pointer(
@@ -226,6 +303,10 @@ def reported_message_pointer(
     callouts = bystander_callouts(messages, out.get("user_id"))
     if callouts:
         out["callouts"] = callouts
+    if out.get("bare_ping"):
+        repeats = repeat_posts(messages, out.get("user_id"))
+        if repeats:
+            out["repeat_posts"] = repeats
     return out
 
 

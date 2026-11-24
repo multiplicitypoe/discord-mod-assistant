@@ -14,6 +14,7 @@ from incident_mod_bot.bot import _with_likely_reported
 from incident_mod_bot.openai_client import OpenAISettings, analyze_incident
 from incident_mod_bot.pipeline.ping_context import (
     bystander_callouts,
+    repeat_posts,
     reporter_followup_text,
     snowflake_at_ms,
 )
@@ -74,16 +75,13 @@ def test_the_bare_ping_guess_has_no_reply_target_authority() -> None:
     assert "reported_message" not in out
 
 
-def test_bystander_callouts_point_at_the_message_they_are_about() -> None:
+def test_a_callout_that_is_not_a_reply_lists_what_was_just_above_it() -> None:
     callouts = reporter()["callouts"]
-    greeting = [c for c in callouts if c["about_message_id"] == GREETING]
-    assert len(greeting) == 1
-    assert greeting[0]["about_author"] == "user_bot"
-    said = " | ".join(s["text"] for s in greeting[0]["said"])
-    assert "sussy" in said and "ahh bot" in said
-    # Link-only posts are skipped when finding what a callout is about, so
-    # "2nd bot to ignore me" does not point at a cat GIF.
-    assert all(c["about_message_id"] not in (sid(-880), sid(-870)) for c in callouts)
+    sussy = [c for c in callouts if "sussy" in c["said"][0]["text"]]
+    assert len(sussy) == 1
+    above = sussy[0]["not_a_reply_so_about_one_of"]
+    assert GREETING in [a["id"] for a in above]
+    assert all(a["id"] < sid(-890) for a in above)
 
 
 def test_a_callout_that_is_a_reply_points_at_its_reply_target() -> None:
@@ -160,7 +158,7 @@ def test_stale_stored_fields_are_recomputed() -> None:
     out = _with_likely_reported(stale, WINDOW, PING)
     assert out["followup_text"][0]["text"] == "likely bot in chat"
     assert "reported_message" not in out
-    assert all(c["about_message_id"] != 1 for c in out["callouts"])
+    assert all(c.get("about_message_id") != 1 for c in out["callouts"])
 
 
 def _instructions() -> str:
@@ -189,3 +187,67 @@ def test_the_prompt_tells_the_model_what_the_new_fields_mean() -> None:
     for needle in ("reporter.followup_text", "reporter.callouts", "it is only a guess",
                    "Never give high confidence to 'no violation'"):
         assert needle in text
+
+
+# The incident that came after: one member posted the same screenshot three
+# times in six seconds, another said "stop spamming it", and the callout was
+# pinned on an unrelated line posted a moment earlier.
+SPAMMER, SPEAKER, ASKER = 2011, 2012, 2013
+NAMES.update({SPAMMER: "user_s", SPEAKER: "user_t", ASKER: "user_u"})
+SHOT = ["image.png (1292x707 image)"]
+
+
+def _spam_window() -> list[dict]:
+    return [
+        m(sid(-20), CHATTER_A, "what jewel is this", reply_to=sid(-100)),
+        m(sid(-16), SPAMMER, "", attachments=SHOT),
+        m(sid(-14), SPAMMER, "ahahahahaa"),
+        m(sid(-12), SPAMMER, "", attachments=SHOT),
+        m(sid(-11), SPAMMER, "", attachments=SHOT),
+        m(sid(-5), SPEAKER, "nice"),
+        m(sid(0), REPORTER, "@Chat Moderator"),
+        m(sid(1), ASKER, "elegant hubris", reply_to=sid(-20)),
+        m(sid(2), SPEAKER, "stop spamming it"),
+    ]
+
+
+def test_repeated_identical_attachments_in_seconds_are_flagged_even_with_no_words() -> None:
+    found = repeat_posts(_spam_window(), REPORTER)
+    assert len(found) == 1
+    assert found[0]["author_name"] == "user_s" and found[0]["times"] == 3
+    assert found[0]["within_seconds"] <= 6
+    assert "image.png (1292x707 image)" in found[0]["same"]
+
+
+def test_ordinary_chatter_and_slow_reposts_are_not_flagged() -> None:
+    window = [m(sid(-i * 100), CHATTER_A, "lol") for i in range(5)]
+    window += [m(sid(-i * 300), CHATTER_B, "", attachments=SHOT) for i in range(4)]
+    window += [m(sid(-9), CHATTER_A, "one"), m(sid(-8), CHATTER_A, "two"), m(sid(-7), CHATTER_A, "three")]
+    assert repeat_posts(window, REPORTER) == []
+
+
+def test_the_reporter_is_never_listed_as_a_repeat_poster() -> None:
+    window = [m(sid(-i), REPORTER, "", attachments=SHOT) for i in range(4)]
+    assert repeat_posts(window, REPORTER) == []
+
+
+def test_stop_spamming_is_not_pinned_on_the_line_above_it() -> None:
+    callouts = bystander_callouts(_spam_window(), REPORTER)
+    assert len(callouts) == 1
+    entry = callouts[0]
+    assert "about_message_id" not in entry
+    above = entry["not_a_reply_so_about_one_of"]
+    assert any(a["text"] == "[attachment]" and a["author"] == "user_s" for a in above)
+
+
+def test_a_bare_ping_carries_repeat_posts_and_a_reply_ping_does_not() -> None:
+    bare = _with_likely_reported(dict(REPORTER_DICT), _spam_window(), sid(0))
+    assert bare["repeat_posts"][0]["author_name"] == "user_s"
+    replying = _with_likely_reported(
+        {"user_id": REPORTER, "name": "user_a", "bare_ping": False}, _spam_window(), sid(0)
+    )
+    assert "repeat_posts" not in replying
+
+
+def test_the_prompt_explains_repeat_posts() -> None:
+    assert "reporter.repeat_posts" in _instructions()
