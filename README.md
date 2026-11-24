@@ -99,7 +99,17 @@ Optional:
 
 Debug-only:
 
-- `OPENAI_DEBUG_DUMP_DIR` (default: `data/openai_debug`) - where to write raw model outputs when JSON parsing fails (only used when `DEBUG_LOGS=true`).
+- `OPENAI_DEBUG_DUMP_DIR` (default: `data/openai_debug`) - where the full raw model output is written whenever JSON parsing fails (newest 20 kept, owner-readable only; it contains the analysed messages).
+
+Brief log:
+
+Every brief writes one JSON line per step to `data/logs/briefs.jsonl`. That covers the ping, the audit log at trigger time, everything the model was given, its raw answer, each follow-up look and each rebuild of the card. Each line has `since_ping_s`, so timing races show up directly. The files rotate by size and are owner-readable only, because they hold Discord messages.
+
+- `BRIEF_LOG_DIR` (default: a `logs` folder next to the database)
+- `BRIEF_LOG_MAX_MB` (default: `20`, per file)
+- `BRIEF_LOG_FILES` (default: `10` files kept; `0` turns the log off)
+
+To see everything about one ping: `jq -c 'select(.anchor_message_id == <ping id>)' data/logs/briefs.jsonl*`
 
 ## OpenAI usage
 

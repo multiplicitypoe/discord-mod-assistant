@@ -138,7 +138,9 @@ async def _replay_from_saved_payload(
         payload["messages"] = _consistent_author_names(
             payload.get("messages") or [], {reporter.get("user_id"): reporter.get("name")}
         )
-        payload["reporter"] = _with_likely_reported(reporter, payload["messages"], anchor_id)
+        payload["reporter"] = _with_likely_reported(
+            reporter, payload["messages"], anchor_id, payload.get("audit_findings")
+        )
         if isinstance(anchor_id, int):
             history = await bot._ping_history(guild_id, payload["reporter"], anchor_id)
             if history:

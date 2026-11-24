@@ -399,7 +399,8 @@ async def test_the_card_shows_the_pinger_line(analysed) -> None:
 
 async def test_images_are_capped(analysed, monkeypatch) -> None:
     bot, messages, sent = analysed
-    many = [FakeAttachment(20 + i, f"{i}.png", _png("green")) for i in range(5)]
+    colours = ["green", "yellow", "purple", "orange", "pink"]
+    many = [FakeAttachment(20 + i, f"{i}.png", _png(c)) for i, c in enumerate(colours)]
     messages[4].attachments = many  # the reported message itself
     _, _, payload = await bot._analyze_incident_messages(
         guild_id=9, messages=messages, mod_role_id=None, anchor_message_id=C1_PING,
@@ -408,6 +409,25 @@ async def test_images_are_capped(analysed, monkeypatch) -> None:
     images = [c for c in sent["input"][0]["content"] if c["type"] == "input_image"]
     assert len(images) == IncidentBot._ANALYSIS_MAX_IMAGES
     assert sum(len(d["image_ids"]) for d in payload["messages"]) == len(images)
+
+
+async def test_the_same_image_posted_again_is_sent_once(analysed) -> None:
+    bot, messages, sent = analysed
+    messages[4].attachments = [FakeAttachment(30, "a.png", _png("green"))]
+    messages[5].attachments = [FakeAttachment(31, "b.png", _png("green"))]
+    messages[6].attachments = [FakeAttachment(32, "c.png", _png("green"))]
+    _, _, payload = await bot._analyze_incident_messages(
+        guild_id=9, messages=messages, mod_role_id=None, anchor_message_id=C1_PING,
+        ctx="test", reporter=reporter(),
+    )
+    by_id = {d["id"]: d for d in payload["messages"]}
+    ids = {i for n in (4, 5, 6) for i in by_id[messages[n].id].get("image_ids", [])}
+    assert len(ids) == 1, "three copies of one file should be one image"
+    for n in (4, 5, 6):
+        assert by_id[messages[n].id].get("image_ids"), "each copy still points at the image"
+    sent_images = [c for c in sent["input"][0]["content"] if c["type"] == "input_image"]
+    every_id = {i for d in payload["messages"] for i in d.get("image_ids", [])}
+    assert len(sent_images) == len(every_id)
 
 
 async def test_a_failed_download_leaves_a_text_only_analysis(analysed) -> None:

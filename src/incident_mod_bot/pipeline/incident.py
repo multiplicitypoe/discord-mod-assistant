@@ -36,6 +36,9 @@ class EvidenceQuote(BaseModel):
     quote: str
     message_id: int | None = None
     link: str | None = None
+    # The quoted message is gone (usually a ban deleting it) and link jumps
+    # to the nearest message still there.
+    deleted: bool = False
 
 
 class ImageNote(BaseModel):

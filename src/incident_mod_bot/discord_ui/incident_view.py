@@ -136,6 +136,126 @@ def _humanise_until(start, until) -> str:
     return f"for {seconds}s"
 
 
+_MOD_AUDIT_ACTIONS = (
+    discord.AuditLogAction.ban,
+    discord.AuditLogAction.kick,
+    discord.AuditLogAction.unban,
+    discord.AuditLogAction.member_update,
+    discord.AuditLogAction.message_delete,
+    discord.AuditLogAction.message_bulk_delete,
+)
+_AUDIT_PER_ACTION = 100
+
+
+async def moderation_audit_entries(
+    guild: Any, after: datetime, actions: tuple[Any, ...] = _MOD_AUDIT_ACTIONS
+) -> list[Any]:
+    """Audit entries of the kinds moderation leaves, oldest first.
+
+    One unfiltered read of 200 entries from 20 minutes before a ping did not
+    reach a timeout 15 minutes in on 2026-11-09: autorole and nickname
+    entries filled it first. Asking for each action on its own keeps them
+    out.
+    """
+    seen: set[Any] = set()
+    out: list[Any] = []
+    for action in actions:
+        async for entry in guild.audit_logs(limit=_AUDIT_PER_ACTION, after=after, action=action):
+            key = getattr(entry, "id", None) or id(entry)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(entry)
+    if all(getattr(e, "created_at", None) is not None for e in out):
+        out.sort(key=lambda e: e.created_at)
+    return out
+
+
+def _relative_to_ping(when: datetime, anchor_at: datetime) -> str:
+    seconds = int((when - anchor_at).total_seconds())
+    span = abs(seconds)
+    text = f"{span}s" if span < 60 else f"{round(span / 60)}m" if span < 3600 else f"{round(span / 3600)}h"
+    return f"{text} before the ping" if seconds < 0 else f"{text} after the ping"
+
+
+async def collect_related_mod_actions(
+    guild: Any,
+    user_ids: set[int],
+    anchor_message_id: int,
+    *,
+    lookback_s: int = _AUDIT_LOOKBACK_BEFORE_S,
+) -> list[str]:
+    """Bans, kicks and timeouts of people the conversation names but who did
+    not post in it.
+
+    On 2026-11-09 a moderator timed out user_x five minutes before a ping,
+    and the chat being reported was members saying the new account was user_x
+    back again ("people think @user_y is @user_x who just got timed out"). The
+    audit look only covered people who posted, so the brief judged "Any ps
+    players?" on its own and called it nothing. These lines are context
+    about someone else, never enforcement against the person reported.
+    """
+    if guild is None or not user_ids:
+        return []
+    anchor_at = _snowflake_created_at(anchor_message_id)
+    lines: list[str] = []
+    seen: set[tuple] = set()
+    try:
+        for entry in await moderation_audit_entries(
+            guild,
+            anchor_at - timedelta(seconds=lookback_s),
+            (
+                discord.AuditLogAction.ban,
+                discord.AuditLogAction.kick,
+                discord.AuditLogAction.member_update,
+            ),
+        ):
+            target = _entry_target(entry)
+            try:
+                target_id = int(getattr(target, "id", None))
+            except (TypeError, ValueError):
+                continue
+            if target_id not in user_ids:
+                continue
+            name = (
+                getattr(target, "display_name", None)
+                or getattr(target, "name", None)
+                or str(target_id)
+            )
+            action = entry.action
+            if action is discord.AuditLogAction.member_update:
+                until = getattr(getattr(entry, "after", None), "timed_out_until", None)
+                if until is None:
+                    continue
+                verb = f"Timed out {name} {_humanise_until(entry.created_at, until)}"
+            elif action is discord.AuditLogAction.ban:
+                verb = f"Banned {name}"
+            elif action is discord.AuditLogAction.kick:
+                verb = f"Kicked {name}"
+            else:
+                continue
+            key = (target_id, action)
+            if key in seen:
+                continue
+            seen.add(key)
+            reason = (getattr(entry, "reason", None) or "").strip()
+            who = (
+                getattr(entry.user, "display_name", None)
+                or getattr(entry.user, "name", None)
+                or "unknown"
+            )
+            lines.append(
+                f"{verb}{f' ({reason})' if reason else ''} · by {who} · "
+                f"{_relative_to_ping(entry.created_at, anchor_at)}"
+            )
+    except (discord.Forbidden, discord.HTTPException):
+        return []
+    except Exception:
+        logger.exception("Related audit-log look failed")
+        return []
+    return lines[:_AUDIT_MAX_LINES]
+
+
 def _entry_target(entry: Any) -> Any:
     """entry.target, or None when discord.py cannot resolve it.
 
@@ -599,7 +719,10 @@ class IncidentView(discord.ui.View):
                         outcome="; ".join(shown)[:500],
                     )
                 await self._trigger_evidence_refresh(
-                    interaction, message, extra_target_user_ids=extra_target_user_ids
+                    interaction,
+                    message,
+                    extra_target_user_ids=extra_target_user_ids,
+                    audit_lines=list(shown),
                 )
 
             # A reply is provisional: a moderator can say "on it" before doing
@@ -627,7 +750,10 @@ class IncidentView(discord.ui.View):
                             outcome="; ".join(shown)[:500],
                         )
                     await self._trigger_evidence_refresh(
-                        interaction, message, extra_target_user_ids=extra_target_user_ids
+                        interaction,
+                        message,
+                        extra_target_user_ids=extra_target_user_ids,
+                        audit_lines=list(shown),
                     )
                     break
 
@@ -644,7 +770,12 @@ class IncidentView(discord.ui.View):
             logger.exception("Failed to attach the action summary")
 
     async def _trigger_evidence_refresh(
-        self, interaction: Any, message: Any, *, extra_target_user_ids: set[int] | None
+        self,
+        interaction: Any,
+        message: Any,
+        *,
+        extra_target_user_ids: set[int] | None,
+        audit_lines: list[str] | None = None,
     ) -> None:
         """Recompute the brief itself, not just the Action-taken field.
 
@@ -691,6 +822,7 @@ class IncidentView(discord.ui.View):
                 guild_id=guild.id,
                 ctx=f"mark_handled_refresh {getattr(message, 'id', '?')}",
                 extra_target_user_ids=extra_target_user_ids,
+                audit_lines=audit_lines,
             )
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return
@@ -764,6 +896,12 @@ class IncidentView(discord.ui.View):
         # incident started, not for the lookback before it.
         window_ids = await self._window_author_ids(interaction)
         window_ids -= participant_ids
+        # One name per person across every look. What discord.py can call a
+        # banned account depends on what it has cached at that moment (a
+        # username, a global display name), so the same ban read twice came
+        # out as "Banned user_p" and then "Banned Pip", two lines that
+        # merge_new_lines rightly could not tell were one event.
+        window_names = await self._window_author_names(interaction)
         incident_start = (
             _snowflake_created_at(self.payload.anchor_message_id)
             if self.payload.anchor_message_id
@@ -772,7 +910,7 @@ class IncidentView(discord.ui.View):
         found: list[str] = []
         seen: set[tuple] = set()
         try:
-            entries = [e async for e in guild.audit_logs(limit=_AUDIT_SCAN_LIMIT, after=after)]
+            entries = await moderation_audit_entries(guild, after)
 
             # Someone can be acted on without ever reaching the brief, which is
             # exactly what happens when the bot could not read what they posted.
@@ -821,7 +959,7 @@ class IncidentView(discord.ui.View):
                 # Someone pulled in from the audit log alone has no entry in the
                 # brief, so take whatever name the log itself carries.
                 target_obj = _entry_target(entry)
-                subject = names.get(target_id) or (
+                subject = names.get(target_id) or window_names.get(target_id) or (
                     getattr(target_obj, "display_name", None)
                     or getattr(target_obj, "name", None)
                     or str(target_id)
@@ -905,6 +1043,30 @@ class IncidentView(discord.ui.View):
             except (TypeError, ValueError):
                 continue
         return ids
+
+    async def _window_author_names(self, interaction: Any) -> dict[int, str]:
+        """The name the brief's own analysis used for each person in the window,
+        keyed by id. Empty when the saved payload is missing."""
+        store = self.memory_store
+        brief_id = getattr(getattr(interaction, "message", None), "id", None)
+        if store is None or not brief_id:
+            return {}
+        try:
+            found = await store.get_incident_payload(int(brief_id))
+        except Exception:
+            logger.exception("Could not load the saved payload for author names")
+            return {}
+        if not found:
+            return {}
+        out: dict[int, str] = {}
+        for m in found[1].get("messages") or []:
+            if not isinstance(m, dict) or not m.get("author_name"):
+                continue
+            try:
+                out.setdefault(int(m.get("author_id")), str(m["author_name"]))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     async def _collect_recent_mod_channel_replies(
         self, interaction: Any, since: datetime | None = None

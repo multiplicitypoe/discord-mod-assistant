@@ -117,7 +117,7 @@ async def test_a_moderators_reply_to_the_ping_is_the_action_summary():
     anchor_id = 1542361005378764881
     reply = FakeChannelMessage(
         1542361152871338154,
-        FakeModAuthor("user_h6"),
+        FakeModAuthor("mod_d"),
         "honestly I don't know",
         reference=FakeReference(anchor_id),
     )
@@ -130,12 +130,12 @@ async def test_a_moderators_reply_to_the_ping_is_the_action_summary():
     found = await view._collect_recent_mod_channel_replies(interaction)
 
     assert found, "the moderator's reply to the ping was not picked up"
-    assert "user_h6" in found[0]
+    assert "mod_d" in found[0]
     assert "honestly I don't know" in found[0]
 
 
 async def test_a_follow_up_from_the_same_moderator_also_counts():
-    """The real second half of the same incident: user_h6's actual answer
+    """The real second half of the same incident: mod_d's actual answer
     was a reply, but the more substantial message - asking whether to
     forward a GGG member's message - was a plain follow-up two minutes
     later, no reply reference at all. Missing this was the whole complaint:
@@ -144,13 +144,13 @@ async def test_a_follow_up_from_the_same_moderator_also_counts():
     anchor_id = 1542361005378764881
     reply = FakeChannelMessage(
         1542361152871338154,
-        FakeModAuthor("user_h6"),
+        FakeModAuthor("mod_d"),
         "honestly I don't know",
         reference=FakeReference(anchor_id),
     )
     follow_up = FakeChannelMessage(
         1542361641478258728,
-        FakeModAuthor("user_h6"),
+        FakeModAuthor("mod_d"),
         "do you guys think I should forward the GGG member's message?",
     )
     view = _view(anchor_id)
@@ -161,7 +161,7 @@ async def test_a_follow_up_from_the_same_moderator_also_counts():
     assert len(found) == 2, "the follow-up should ride along with the reply that earned it"
     assert "honestly I don't know" in found[0], "the reply should lead, the follow-up second"
     assert "forward the GGG member's message" in found[1]
-    assert "user_h6" in found[1]
+    assert "mod_d" in found[1]
 
 
 async def test_a_follow_up_from_an_uninvolved_moderator_does_not_count():
@@ -171,7 +171,7 @@ async def test_a_follow_up_from_an_uninvolved_moderator_does_not_count():
     anchor_id = 1542361005378764881
     reply = FakeChannelMessage(
         1,
-        FakeModAuthor("user_h6"),
+        FakeModAuthor("mod_d"),
         "honestly I don't know",
         reference=FakeReference(anchor_id),
     )
@@ -186,7 +186,7 @@ async def test_a_follow_up_from_an_uninvolved_moderator_does_not_count():
     found = await view._collect_recent_mod_channel_replies(interaction)
 
     assert len(found) == 1
-    assert "user_h6" in found[0]
+    assert "mod_d" in found[0]
 
 
 async def test_a_reply_from_a_non_moderator_does_not_count():
@@ -210,7 +210,7 @@ async def test_a_moderator_message_that_is_not_a_reply_does_not_count():
     a very busy channel and moderators are in it constantly for other reasons."""
     anchor_id = 1542361005378764881
     unrelated = FakeChannelMessage(
-        3, FakeModAuthor("user_h6"), "unrelated chat, no reference at all"
+        3, FakeModAuthor("mod_d"), "unrelated chat, no reference at all"
     )
     view = _view(anchor_id)
     interaction = FakeInteraction(FakeGuild(), FakeClient(FakeChannel([unrelated])))

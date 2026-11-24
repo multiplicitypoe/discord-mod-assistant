@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import re
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -23,6 +26,7 @@ from incident_mod_bot.discord_ui.incident_view import (
     IncidentView,
     IncidentViewPayload,
     _snowflake_created_at,
+    collect_related_mod_actions,
     merge_new_lines,
 )
 from incident_mod_bot.discord_ui.view_store import ViewRecord, ViewStore
@@ -45,9 +49,11 @@ from incident_mod_bot.pipeline.ping_context import (
     PING_HISTORY_WINDOW_S,
     analysis_image_candidates,
     build_ping_history,
+    enforcement_conflict,
     format_ping_history,
     reported_message_pointer,
 )
+from incident_mod_bot.utils import brief_log
 from incident_mod_bot.utils.discord import display_name, is_mod
 from incident_mod_bot.utils.images import resize_image_bytes, to_data_url
 from incident_mod_bot.utils.text import compress_text, human_timedelta, truncate
@@ -121,13 +127,41 @@ def _resolved_reply(message: Any) -> list[discord.Message]:
     return [resolved] if getattr(resolved, "author", None) is not None else []
 
 
+def _carry_prior_read(
+    earlier: dict[str, Any] | None, result: IncidentResult, *, images_seen: int
+) -> dict[str, Any]:
+    """What to remember of this look for the next one.
+
+    Images are fetched live each time an incident is analysed, and the usual
+    first move on spam or NSFW is a ban that deletes the account's message
+    history - often within a second of the brief posting. Whatever the first
+    look saw in those images then exists nowhere but in its own conclusion, so
+    a later rebuild (the one Mark Handled triggers) could only say "posted the
+    same image attachment four times" and dropped the nsfw rule. A look that
+    saw fewer images than an earlier one must not overwrite what the earlier
+    one understood.
+    """
+    if earlier and int(earlier.get("images_seen") or 0) > images_seen:
+        return earlier
+    return {
+        "headline": result.headline,
+        "summary": result.summary,
+        "rules": [r.id for r in (result.rule_refs or [])],
+        "images_seen": images_seen,
+    }
+
+
 def _with_likely_reported(
-    reporter: dict[str, Any], messages: list[dict[str, Any]], anchor_message_id: int | None
+    reporter: dict[str, Any],
+    messages: list[dict[str, Any]],
+    anchor_message_id: int | None,
+    audit_findings: list[str] | None = None,
 ) -> dict[str, Any]:
     """Point the model at the message the ping is about. See
     ping_context.reported_message_pointer: the reply target for a reply-ping,
-    else for a bare ping the last message before it from someone else."""
-    return reported_message_pointer(reporter, messages, anchor_message_id)
+    else for a bare ping the author a moderator acted on just before it, or
+    the last message before it from someone else."""
+    return reported_message_pointer(reporter, messages, anchor_message_id, audit_findings)
 
 
 def _ping_context_text(ping: discord.Message, role_names: str, channel_name: str) -> str:
@@ -223,6 +257,12 @@ def _consistent_author_names(
     ]
 
 
+def _by_id(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Channel order. Stored, recovered-deleted and live messages arrive in
+    separate lists, and the model reads position as sequence."""
+    return sorted(messages, key=lambda m: m["id"] if isinstance(m.get("id"), int) else 0)
+
+
 def _with_relative_times(
     messages: list[dict[str, Any]], anchor_message_id: int | None
 ) -> list[dict[str, Any]]:
@@ -305,13 +345,28 @@ class IncidentBot(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
-        super().__init__(intents=intents)
+        # The gateway cache is where a message deleted before the bot reads
+        # history can still be found (see _remember_deleted). The default
+        # 1000 is a few minutes of this server.
+        super().__init__(intents=intents, max_messages=5000)
+        # Recently deleted messages per channel, compressed, from the cache.
+        self._recently_deleted: dict[int, deque[dict[str, Any]]] = {}
+        try:
+            brief_log.configure(
+                os.getenv("BRIEF_LOG_DIR")
+                or os.path.join(os.path.dirname(settings.db_path) or ".", "logs")
+            )
+        except Exception:
+            logger.exception("Could not start the rolling brief log")
         self.settings = settings
         self.tree = GuildScopedCommandTree(self)
         self.memory_store = MemoryStore(settings.db_path)
         self.view_store = ViewStore(settings.db_path)
         self.openai = create_client(settings.openai_api_key)
         self._auto_last_run: dict[tuple[int, int], float] = {}
+        # The latest ping a channel's cooldown turned away, so that if the run
+        # holding the cooldown fails it is not left unanswered.
+        self._auto_held: dict[tuple[int, int], discord.Message] = {}
 
     def _ctx(self, interaction: discord.Interaction) -> str:
         guild = interaction.guild
@@ -552,6 +607,103 @@ class IncidentBot(discord.Client):
                     dm = dm[len(name) :].lstrip(" \t\r\n,.:;-\"")
                     result.draft_message = dm
 
+    def _remember_deleted(self, messages: list[Any]) -> None:
+        """Keep what a deleted message said, for a brief about to be built.
+
+        A moderator banning with message deletion often beats the bot to the
+        channel history: the ping lands, the ban lands, and by the time the
+        window is fetched the message the ping was about is gone. The
+        gateway cache still had it when Discord said it was deleted.
+        """
+        for message in messages:
+            if message is None or getattr(message.author, "bot", False):
+                continue
+            channel_id = getattr(message.channel, "id", None)
+            if channel_id is None:
+                continue
+            try:
+                entry = self._compress_messages([message], set())[0]
+            except Exception:
+                continue
+            entry["deleted"] = True
+            if not hasattr(self, "_recently_deleted"):
+                self._recently_deleted = {}
+            self._recently_deleted.setdefault(channel_id, deque(maxlen=300)).append(entry)
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        self._remember_deleted([payload.cached_message])
+
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
+        self._remember_deleted(list(payload.cached_messages or []))
+
+    def _deleted_in_window(
+        self, channel_id: int, messages: list[Any], anchor_id: int
+    ) -> list[dict[str, Any]]:
+        """Deleted messages that fell inside a fetched window, oldest first."""
+        ring = getattr(self, "_recently_deleted", {}).get(channel_id)
+        if not ring or not messages:
+            return []
+        have = {m.id for m in messages}
+        start = min(have)
+        found = {d["id"]: d for d in ring if start <= d["id"] <= anchor_id and d["id"] not in have}
+        return [found[i] for i in sorted(found)]
+
+    async def _audit_at_trigger(
+        self, guild: discord.Guild, channel: Any, anchor: discord.Message, messages: list[Any]
+    ) -> list[str]:
+        """What moderators already did before the brief is written.
+
+        The audit log was only read 30 seconds after posting, so a ban or
+        timeout that landed just before or with the ping could only ever
+        reach a rebuild, and a first read made without it.
+        """
+        try:
+            return await self._audit_at_trigger_inner(guild, channel, anchor, messages)
+        except Exception:
+            logger.exception("Audit-log check at trigger time failed")
+            return []
+
+    async def _audit_at_trigger_inner(
+        self, guild: discord.Guild, channel: Any, anchor: discord.Message, messages: list[Any]
+    ) -> list[str]:
+        seen: set[int] = set()
+        participants: list[dict[str, Any]] = []
+        for m in messages:
+            if m.author.id in seen or m.author.bot:
+                continue
+            seen.add(m.author.id)
+            participants.append({"user_id": m.author.id, "name": display_name(m.author)})
+        probe = IncidentView(
+            payload=IncidentViewPayload(
+                draft_message="",
+                reply_targets=[],
+                draft_replies=[],
+                memory_suggestions={},
+                mod_role_id=None,
+                participants=participants,
+                evidence_quotes=[],
+                recommendations=[],
+                rule_ids=[],
+                source_channel_id=getattr(channel, "id", None),
+                allow_post=False,
+                allow_actions=False,
+                anchor_message_id=anchor.id,
+                handled=False,
+            ),
+            memory_store=self.memory_store,
+            view_store=self.view_store,
+        )
+        try:
+            return await probe._collect_recent_mod_actions(
+                SimpleNamespace(guild=guild, message=None),
+                since=anchor.created_at - timedelta(seconds=_AUDIT_LOOKBACK_BEFORE_S),
+            )
+        except Exception:
+            logger.exception("Audit-log check at trigger time failed")
+            return []
+        finally:
+            probe.stop()
+
     async def on_ready(self) -> None:
         logger.info("Logged in as %s", self.user)
         if self.settings.debug_logs:
@@ -619,6 +771,40 @@ class IncidentBot(discord.Client):
 
         asyncio.create_task(self._handle_auto_mod_ping(message, mod_role_id=mod_role_id))
 
+    async def _analysis_failed(
+        self,
+        key: tuple[int, int],
+        message: discord.Message,
+        dest_channel: discord.TextChannel,
+        ping_text: str,
+        *,
+        mod_role_id: int | None,
+    ) -> None:
+        """A ping whose analysis failed must not vanish.
+
+        Two pings landed in the same second; the first took the channel's
+        cooldown, the second was dropped by it, then the first's analysis came
+        back as unusable output and raised. Nothing was posted for either.
+        So: say so in the mod channel, give the cooldown back, and run the ping
+        the cooldown had turned away, which nothing now covers.
+        """
+        self._auto_last_run.pop(key, None)
+        embed = discord.Embed(
+            title=ping_text,
+            url=message.jump_url,
+            description="No brief: the analysis failed. Open the ping to review it.",
+            color=discord.Color.orange(),
+        )
+        try:
+            await dest_channel.send(
+                embed=embed, allowed_mentions=discord.AllowedMentions.none(), silent=True
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Could not post the analysis-failed notice")
+        held = self._auto_held.pop(key, None)
+        if held is not None and held.id != message.id:
+            asyncio.create_task(self._handle_auto_mod_ping(held, mod_role_id=mod_role_id))
+
     async def _handle_auto_mod_ping(self, message: discord.Message, *, mod_role_id: int | None) -> None:
         guild = message.guild
         if not guild:
@@ -671,8 +857,14 @@ class IncidentBot(discord.Client):
         now_mono = time.monotonic()
         last = self._auto_last_run.get(key)
         if last is not None and now_mono - last < cooldown_s:
+            self._auto_held[key] = message
+            logger.info(
+                "Auto mod ping held by the %ss channel cooldown src=%s user=%s ping=%s",
+                cooldown_s, source_parent.id, message.author.id, message.id,
+            )
             return
         self._auto_last_run[key] = now_mono
+        self._auto_held.pop(key, None)
 
         dest_channel_id: int | None = None
         for role in message.role_mentions:
@@ -724,6 +916,7 @@ class IncidentBot(discord.Client):
                 channel, limit=use_limit, end_message=message
             )
         except (discord.Forbidden, discord.HTTPException):
+            self._auto_last_run.pop(key, None)
             return
         if not messages:
             return
@@ -740,6 +933,21 @@ class IncidentBot(discord.Client):
             f"channel={getattr(channel, 'id', None)}({getattr(channel, 'name', None)!r}) "
             f"user={message.author.id}({display_name(message.author)!r})"
         )
+        deleted_before = self._deleted_in_window(channel.id, messages, message.id)
+        audit_at_trigger = await self._audit_at_trigger(guild, channel, message, messages)
+        brief_log.record(
+            "trigger",
+            ctx=ctx,
+            guild_id=guild.id,
+            channel_id=channel.id,
+            anchor_message_id=message.id,
+            reporter_id=message.author.id,
+            ping_text=getattr(message, "content", None),
+            reply_to=getattr(getattr(message, "reference", None), "message_id", None),
+            window=len(messages),
+            deleted_recovered=[d["id"] for d in deleted_before],
+            audit_at_trigger=audit_at_trigger,
+        )
         try:
             result, raw_result, analysis_payload = await self._analyze_incident_messages(
                 guild_id=guild.id,
@@ -747,14 +955,22 @@ class IncidentBot(discord.Client):
                 mod_role_id=mod_role_id,
                 anchor_message_id=message.id,
                 ctx=ctx,
+                precompressed_base=deleted_before or None,
+                audit_findings=audit_at_trigger or None,
                 reporter=_ping_reporter(message),
                 extra_messages=_resolved_reply(message),
             )
         except AuthenticationError:
             logger.exception("OpenAI auth error during auto /mod")
+            self._auto_last_run.pop(key, None)
             return
         except Exception:
             logger.exception("Auto /mod failed")
+            await self._analysis_failed(
+                key, message, dest_channel,
+                _ping_context_text(message, role_names, source_parent.name),
+                mod_role_id=mod_role_id,
+            )
             return
 
         # The verb carries the link. A trailing "(jump)" is a second thing to read
@@ -769,6 +985,12 @@ class IncidentBot(discord.Client):
             scan_label=scan_label,
             context=context,
         )
+        if audit_at_trigger:
+            embed.add_field(
+                name=_ACTION_FIELD,
+                value="\n".join(f"• {line}" for line in audit_at_trigger)[:1024],
+                inline=False,
+            )
 
         action_participants: list[dict[str, Any]] = []
         seen_users: set[int] = set()
@@ -818,6 +1040,16 @@ class IncidentBot(discord.Client):
             )
         except (discord.Forbidden, discord.HTTPException):
             return
+        brief_log.record(
+            "brief_posted",
+            ctx=ctx,
+            brief_message_id=posted.id,
+            anchor_message_id=message.id,
+            headline=getattr(result, "headline", ""),
+            summary=result.summary,
+            recommendations=list(result.recommendations or []),
+            embed=embed.to_dict(),
+        )
         logger.info(
             "BRIEF posted via=%s msg=%s channel=%s headline=%r participants=%d "
             "rules=%s recommendations=%d confidence=%.2f reply_to=%s draft=%r",
@@ -1615,6 +1847,106 @@ class IncidentBot(discord.Client):
             )
         )
 
+    async def _link_evidence(
+        self,
+        quotes: list[Any],
+        *,
+        live_links: dict[int, str],
+        channel: Any,
+        known_messages: list[dict[str, Any]],
+        anchor_message_id: int | None,
+    ) -> None:
+        """Give every evidence quote a jump link that lands somewhere real.
+
+        Links used to come only from the messages fetched live for this
+        look, and the card drops a quote with no link. Since 2026-09-19 a
+        brief is rebuilt when a moderator acts, and a ban deletes the
+        offender's messages first, so 18 of 20 briefs lost their Evidence
+        field. A link is just guild/channel/message, so it is always
+        buildable. When the message is gone, link the nearest one still
+        there; when the quote names no message, find it by its text, else
+        link the ping itself.
+        """
+        if not quotes:
+            return
+        guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        channel_id = getattr(channel, "id", None)
+
+        def url(mid: int) -> str | None:
+            if guild_id and channel_id:
+                return f"https://discord.com/channels/{guild_id}/{channel_id}/{mid}"
+            return None
+
+        def by_text(quote: str) -> int | None:
+            needle = " ".join((quote or "").lower().split())[:80]
+            if len(needle) < 4:
+                return None
+            hits = [
+                m["id"]
+                for m in known_messages
+                if isinstance(m.get("id"), int)
+                and (needle in " ".join(str(m.get("content") or "").lower().split()))
+            ]
+            return hits[-1] if hits else None
+
+        for q in quotes[:6]:
+            q.deleted = False
+            mid = q.message_id or by_text(q.quote)
+            if mid is None:
+                if anchor_message_id is not None:
+                    q.link = live_links.get(anchor_message_id) or url(anchor_message_id) or q.link
+                continue
+            if mid in live_links:
+                q.link = live_links[mid]
+                continue
+            q.link = url(mid) or q.link
+            fetch = getattr(channel, "fetch_message", None)
+            if fetch is None:
+                continue
+            try:
+                await fetch(mid)
+                continue
+            except discord.NotFound:
+                pass
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+            # Gone. Jump to whatever is still nearest it in the channel.
+            try:
+                around = [
+                    m.id
+                    async for m in channel.history(around=discord.Object(id=mid), limit=11)
+                    if m.id != mid
+                ]
+            except (discord.Forbidden, discord.HTTPException):
+                around = []
+            if around:
+                nearest = min(around, key=lambda i: abs(i - mid))
+                q.link = url(nearest) or q.link
+            q.deleted = True
+
+    async def _related_mod_actions(
+        self, guild_id: int, messages: list[dict[str, Any]], anchor_message_id: int
+    ) -> list[str]:
+        """Moderation of people the window mentions but who did not post in it.
+        See collect_related_mod_actions."""
+        authors = {m.get("author_id") for m in messages}
+        mentioned = {
+            int(u)
+            for m in messages
+            for u in (m.get("mention_ids") or [])
+            if int(u) not in authors and int(u) != getattr(self.user, "id", None)
+        }
+        if not mentioned:
+            return []
+        guild = self.get_guild(guild_id)
+        if guild is None:
+            # refresh_brief and replay log in without the gateway cache.
+            try:
+                guild = await self.fetch_guild(guild_id)
+            except (discord.Forbidden, discord.HTTPException):
+                return []
+        return await collect_related_mod_actions(guild, mentioned, anchor_message_id)
+
     async def _analyze_incident_messages(
         self,
         *,
@@ -1629,7 +1961,12 @@ class IncidentBot(discord.Client):
         prior_authors: dict[str, dict[str, Any]] | None = None,
         extra_messages: list[discord.Message] | None = None,
         fetch_message: Any = None,
+        prior_read: dict[str, Any] | None = None,
     ) -> tuple[IncidentResult, dict[str, Any], dict[str, Any]]:
+        # prior_read: what an earlier look at this same incident concluded,
+        # kept because images are fetched live and a moderator banning the
+        # account routinely deletes the messages (and so the images) within
+        # seconds of the brief posting. See _carry_prior_read.
         # The few images nearest the ping go in with the text (see
         # _collect_analysis_images); the background pass looks at the rest.
         # extra_messages: live copies of messages outside `messages` (the
@@ -1683,7 +2020,9 @@ class IncidentBot(discord.Client):
             "user_memory": user_memory,
             "messages": _with_relative_times(
                 _consistent_author_names(
-                    (precompressed_base or []) + self._compress_messages(messages, set()),
+                    _by_id(
+                        (precompressed_base or []) + self._compress_messages(messages, set())
+                    ),
                     preferred_names,
                 ),
                 anchor_message_id,
@@ -1700,9 +2039,13 @@ class IncidentBot(discord.Client):
             payload["anchor_message_id"] = anchor_message_id
         if audit_findings:
             payload["audit_findings"] = audit_findings
+        if anchor_message_id is not None:
+            related = await self._related_mod_actions(guild_id, payload["messages"], anchor_message_id)
+            if related:
+                payload["related_mod_actions"] = related
         if reporter:
             payload["reporter"] = _with_likely_reported(
-                reporter, payload["messages"], anchor_message_id
+                reporter, payload["messages"], anchor_message_id, audit_findings
             )
             if anchor_message_id is not None:
                 history = await self._ping_history(
@@ -1715,6 +2058,11 @@ class IncidentBot(discord.Client):
         images, analysed_media = await self._collect_analysis_images(
             payload, live=live, fetch_message=fetch_message, ctx=ctx
         )
+        unseen_media = [
+            m for m in payload["messages"] if m.get("attachments") and not m.get("image_ids")
+        ]
+        if prior_read and unseen_media:
+            payload["prior_read"] = {k: v for k, v in prior_read.items() if k != "images_seen"}
 
         self._dlog_ctx(
             ctx,
@@ -1741,6 +2089,44 @@ class IncidentBot(discord.Client):
                     pass
 
         raw_result = await asyncio.create_task(_run_analysis())
+        conflict = enforcement_conflict(raw_result, payload)
+        if conflict:
+            first_raw = raw_result
+            names = ", ".join(conflict)
+            payload["consistency_check"] = (
+                f"An earlier read of this payload answered No action, but audit_findings shows "
+                f"a moderator acted on {names}, who posted in this window. Find what {names} "
+                f"posted and judge it. If it broke a rule, that is the incident: name it in "
+                f"headline and summary and set recommendations to [\"Already handled.\"]. "
+                f"Keep No action only if nothing {names} posted here breaks a rule, and then "
+                f"say in the summary that the moderator's action was for something not shown."
+            )
+            self._dlog_ctx(ctx, "No action despite enforcement on %s - asking again", names)
+            try:
+                raw_result = await asyncio.create_task(_run_analysis())
+            except Exception:
+                logger.exception("Consistency re-ask failed; keeping the first answer")
+                raw_result = first_raw
+            brief_log.record(
+                "consistency_reask",
+                ctx=ctx,
+                anchor_message_id=anchor_message_id,
+                names=conflict,
+                first=first_raw,
+                second=raw_result,
+            )
+            payload.pop("consistency_check", None)
+        brief_log.record(
+            "analysis",
+            ctx=ctx,
+            guild_id=guild_id,
+            anchor_message_id=anchor_message_id,
+            model=openai_settings.model,
+            seconds=round(time.monotonic() - t0, 2),
+            images=[i.get("id") for i in images],
+            payload={k: v for k, v in payload.items() if k != "rules_memory"},
+            raw_result=raw_result,
+        )
         result = parse_incident_result(raw_result, known_users_from_payload(payload))
         # Carry through how much past enforcement shaped this brief, so the
         # ledger's contribution is visible instead of silent.
@@ -1757,11 +2143,17 @@ class IncidentBot(discord.Client):
         self._dlog_ctx(ctx, "analyze_incident parsed in %.2fs", time.monotonic() - t0)
 
         message_links = {m.id: m.jump_url for m in messages}
-        for q in result.evidence_quotes:
-            if q.link:
-                continue
-            if q.message_id and q.message_id in message_links:
-                q.link = message_links[q.message_id]
+        source_channel = next(
+            (m.channel for m in [*messages, *(extra_messages or [])] if getattr(m, "channel", None)),
+            None,
+        )
+        await self._link_evidence(
+            result.evidence_quotes,
+            live_links=message_links,
+            channel=source_channel,
+            known_messages=payload["messages"],
+            anchor_message_id=anchor_message_id,
+        )
         for note in result.memory_suggestions.user_notes:
             if note.evidence_link:
                 continue
@@ -1781,6 +2173,7 @@ class IncidentBot(discord.Client):
             len(result.memory_suggestions.server_notes),
             len(result.memory_suggestions.user_notes),
         )
+        payload["prior_read"] = _carry_prior_read(prior_read, result, images_seen=len(images))
         return result, raw_result, payload
 
     async def _ping_history(
@@ -1840,6 +2233,9 @@ class IncidentBot(discord.Client):
         by_id = {m.get("id"): m for m in messages}
         images: list[dict[str, Any]] = []
         used: set[str] = set()
+        # The same file posted again (a screenshot spammed three times) is
+        # sent once; each message that carried it points at that one image.
+        sent_by_hash: dict[str, str] = {}
         total = 0
 
         async def _source(mid: int) -> Any:
@@ -1894,6 +2290,13 @@ class IncidentBot(discord.Client):
                 for key, data in blobs:
                     if key in used or len(images) >= self._ANALYSIS_MAX_IMAGES:
                         continue
+                    digest = hashlib.sha1(data).hexdigest()
+                    if digest in sent_by_hash:
+                        used.add(key)
+                        dup = by_id.get(mid)
+                        if dup is not None:
+                            dup["image_ids"] = list(dup.get("image_ids") or []) + [sent_by_hash[digest]]
+                        continue
                     try:
                         resized, content_type, _, _ = resize_image_bytes(data, max_dim)
                     except Exception:
@@ -1903,6 +2306,7 @@ class IncidentBot(discord.Client):
                     total += len(resized)
                     used.add(key)
                     image_id = f"img_{mid}_{len(images) + 1}"
+                    sent_by_hash[digest] = image_id
                     images.append(
                         {
                             "id": image_id,
@@ -2099,6 +2503,7 @@ class IncidentBot(discord.Client):
         # The analysis pass already saw these; paying to describe them again
         # would only restate what the brief already says.
         seen_media: set[str] = set(base_result.analysed_media)
+        seen_hashes: set[str] = set()
 
         def _needs_high_detail(context_text: str, *, is_evidence_msg: bool) -> bool:
             if is_evidence_msg:
@@ -2142,11 +2547,14 @@ class IncidentBot(discord.Client):
             base_context = " | ".join(base_context_parts)
 
             is_evidence_msg = msg.id in evidence_message_ids
-            needs_high = _needs_high_detail(base_context, is_evidence_msg=is_evidence_msg)
+            # High detail costs several times the tokens of low, so only a
+            # message whose own wording says the picture is the proof (scam,
+            # DM, payment, link) gets it. Being evidence is not enough.
+            needs_high = _needs_high_detail(base_context, is_evidence_msg=False)
             detail = "high" if needs_high else self.settings.openai_image_detail
             max_dim = self.settings.openai_max_image_dim
             if needs_high:
-                max_dim = max(max_dim, 1024)
+                max_dim = max(max_dim, 768)
 
             for attachment in [
                 a for carrier in media_carriers(msg) for a in carrier.attachments
@@ -2167,6 +2575,10 @@ class IncidentBot(discord.Client):
                     data = await attachment.read()
                 except Exception:
                     continue
+                digest = hashlib.sha1(data).hexdigest()
+                if digest in seen_hashes:
+                    continue
+                seen_hashes.add(digest)
                 resized, content_type, _, _ = resize_image_bytes(
                     data, max_dim
                 )
@@ -2318,11 +2730,13 @@ class IncidentBot(discord.Client):
         self._postprocess_result(refined, messages)
 
         message_links = {m.id: m.jump_url for m in messages}
-        for q in refined.evidence_quotes:
-            if q.link:
-                continue
-            if q.message_id and q.message_id in message_links:
-                q.link = message_links[q.message_id]
+        await self._link_evidence(
+            refined.evidence_quotes,
+            live_links=message_links,
+            channel=source_channel,
+            known_messages=[],
+            anchor_message_id=getattr(view.payload, "anchor_message_id", None),
+        )
         for note in refined.memory_suggestions.user_notes:
             if note.evidence_link:
                 continue
@@ -2473,6 +2887,7 @@ class IncidentBot(discord.Client):
         guild_id: int,
         ctx: str,
         extra_target_user_ids: set[int] | None = None,
+        audit_lines: list[str] | None = None,
         dry_run: bool = False,
         force: bool = False,
     ) -> tuple[discord.Embed, IncidentResult] | None:
@@ -2495,6 +2910,13 @@ class IncidentBot(discord.Client):
         the caller back the embed and result it would have applied. Used by
         `python -m incident_mod_bot.refresh_brief` to preview before editing
         a live brief.
+
+        audit_lines are findings a caller already has in hand - the Mark
+        Handled follow-up shows what it found on the card before it asks for
+        this rebuild, and the rebuild starts from a fresh embed. Without
+        them folded in here, a rebuild whose own audit look came back empty
+        would replace the card with no Action-taken field at all, and run
+        the analysis as though no moderator had done anything.
 
         force=True recomputes and rebuilds the embed even when this look
         finds nothing new - for re-rendering a brief against evidence that
@@ -2524,8 +2946,14 @@ class IncidentBot(discord.Client):
         new_follow_ups = [m for m in follow_ups if m.id not in known_ids]
 
         try:
+            # message= is what lets the look recognise everyone who spoke in
+            # the analysed window: it finds the saved payload by brief id.
+            # Without it that set is empty, and anyone acted on who is not
+            # a named participant (the usual case for the person reported
+            # by a reply-ping) is invisible to this look even though the
+            # same look from Mark Handled saw them.
             found_audit = await view._collect_recent_mod_actions(
-                SimpleNamespace(guild=guild),
+                SimpleNamespace(guild=guild, message=message),
                 since=anchor.created_at - timedelta(seconds=_AUDIT_LOOKBACK_BEFORE_S),
                 extra_target_user_ids=extra_target_user_ids,
             )
@@ -2533,7 +2961,25 @@ class IncidentBot(discord.Client):
             logger.exception("Audit-log check failed during incident evidence refresh")
             found_audit = []
 
-        merged_audit, audit_changed = merge_new_lines(known_audit, found_audit)
+        merged_audit, audit_changed = merge_new_lines(
+            known_audit, [*(audit_lines or []), *found_audit]
+        )
+        brief_log.record(
+            "refresh_look",
+            ctx=ctx,
+            brief_message_id=message.id,
+            anchor_message_id=anchor.id,
+            new_messages=[
+                {"id": m.id, "author": display_name(m.author), "content": m.clean_content[:300]}
+                for m in new_follow_ups
+            ],
+            found_audit=found_audit,
+            merged_audit=merged_audit,
+            audit_changed=audit_changed,
+            force=force,
+            dry_run=dry_run,
+            recompute=bool(new_follow_ups or audit_changed or force),
+        )
         if not new_follow_ups and not audit_changed and not force:
             return
 
@@ -2578,6 +3024,7 @@ class IncidentBot(discord.Client):
                 prior_authors=base_payload.get("authors"),
                 extra_messages=[anchor, *_resolved_reply(anchor)],
                 fetch_message=getattr(channel, "fetch_message", None),
+                prior_read=base_payload.get("prior_read"),
             )
         except AuthenticationError:
             logger.exception("OpenAI auth error during incident evidence refresh")
@@ -2659,6 +3106,18 @@ class IncidentBot(discord.Client):
             await message.edit(embed=new_embed, view=new_view)
         except (discord.Forbidden, discord.NotFound, discord.HTTPException):
             return
+        brief_log.record(
+            "brief_updated",
+            ctx=ctx,
+            brief_message_id=message.id,
+            anchor_message_id=anchor.id,
+            via="refresh",
+            handled=now_handled,
+            headline=getattr(result, "headline", ""),
+            summary=result.summary,
+            recommendations=list(result.recommendations or []),
+            embed=new_embed.to_dict(),
+        )
 
         record = ViewRecord(
             message_id=message.id,
@@ -2812,6 +3271,11 @@ class IncidentBot(discord.Client):
             ref_id = getattr(message.reference, "message_id", None) if message.reference else None
             if message.type == discord.MessageType.reply and isinstance(ref_id, int):
                 entry["reply_to"] = ref_id
+            # Who the message names, by id. clean_content turns <@id> into a
+            # display name, and the audit log only knows ids.
+            mention_ids = [int(u) for u in (getattr(message, "raw_mentions", None) or [])]
+            if mention_ids:
+                entry["mention_ids"] = mention_ids[:5]
             compressed.append(entry)
         return compressed
 
@@ -3042,7 +3506,14 @@ class IncidentBot(discord.Client):
             embed.add_field(name="Draft reply", value=truncate("\n".join(draft_lines), 1024), inline=False)
 
         if result.evidence_quotes:
-            quotes = [f"\"{q.quote}\" [jump]({q.link})" for q in result.evidence_quotes[:2] if q.link]
+            quotes = []
+            for q in result.evidence_quotes[:2]:
+                text = f"\"{truncate(q.quote, 300)}\""
+                if q.link:
+                    text += f" [jump]({q.link})"
+                if q.deleted:
+                    text += " (deleted, link goes to the nearest message)"
+                quotes.append(text)
             if quotes:
                 embed.add_field(name="Evidence", value=truncate("\n".join(quotes), 1024), inline=False)
 

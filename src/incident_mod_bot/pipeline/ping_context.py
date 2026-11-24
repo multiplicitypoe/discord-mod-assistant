@@ -36,12 +36,32 @@ _CALLOUT_RE = re.compile(
     r"spamming|spammy|fake|catfish|phish\w*|chat ?gpt|gpt|ai|prompt|hacked|compromised)\b",
     re.IGNORECASE,
 )
+# A bystander calling for a moderator themselves. Only a short message that is
+# nothing but the call: "mods" on its own in PoE chat usually means item mods.
+# On 2026-11-10 a referral link drew "modssssssss" and "nuke this mf" before
+# the bare ping, and neither was seen.
+_MOD_CALL_RE = re.compile(
+    r"\s*(?:@?mod+s*|@?moderators?|mods? (?:pls|please|where|help|\?+)|"
+    r"(?:nuke|ban+|kick|delete|remove) (?:this|him|her|them|that|it|pls|please)\b.*)"
+    r"[\s!?.]*",
+    re.IGNORECASE,
+)
+MOD_CALL_MAX_LEN = 40
+# The verbs collect_recent_mod_actions writes. "Banned spam_user_d · by mod_b".
+_ENFORCEMENT_RE = re.compile(
+    r"^(?:Banned|Kicked|Timed out|Deleted \d+ messages? from|Deleted a message from)\s+(.+?)"
+    r"(?:\s+for\s+\S+.*?)?(?:\s+\([^)]*\))?\s+·\s+by\s+",
+)
+# How close before a bare ping a message has to be for a moderator's action on
+# its author to be what the ping was about.
+AUDIT_POINTER_WITHIN_MS = 5 * 60 * 1000
 # One member posting the same thing again and again in a few seconds.
 REPEAT_WITHIN_MS = 30 * 1000
 REPEAT_MIN = 3
 REPEAT_MAX_LISTED = 3
 _MENTION_ONLY_RE = re.compile(r"(?:@[\w\-]+(?: [\w\-]+)*\s*)+")
 _URL_ONLY_RE = re.compile(r"(?:https?://\S+\s*)+")
+_GIF_RE = re.compile(r"tenor\.com|giphy\.com|/gifs?/|\.gif\b", re.IGNORECASE)
 
 
 def snowflake_ms(snowflake: int) -> int:
@@ -176,17 +196,20 @@ def _gist(message: dict[str, Any]) -> str:
     return "[attachment]" if message.get("attachments") else "[empty]"
 
 
+def _is_mod_call(text: str) -> bool:
+    text = text.strip()
+    return len(text) <= MOD_CALL_MAX_LEN and bool(_MOD_CALL_RE.fullmatch(text))
+
+
 def bystander_callouts(
     messages: list[dict[str, Any]], reporter_id: Any
 ) -> list[dict[str, Any]]:
-    """Other members voicing suspicion, and what they were talking about.
+    """Other members voicing suspicion, with the message each one is about.
 
-    "same prompt ahh bot" is about a message above it, not the one nearest
-    the mod ping 30 messages later. A reply names its target. Anything else
-    could be about any of the last few messages, including an image with no
-    words ("stop spamming it" after three screenshots), so those list what
-    was just above instead of picking one. These are hints for the model,
-    never facts.
+    "same prompt ahh bot" is about the message above it, not the one nearest
+    the mod ping 30 messages later. A reply names its target; otherwise it is
+    the previous message with words in it from someone else. These are hints
+    for the model, never facts.
     """
     ordered = sorted((m for m in messages if isinstance(m.get("id"), int)), key=lambda m: m["id"])
     by_id = {m["id"]: m for m in ordered}
@@ -195,32 +218,59 @@ def bystander_callouts(
         if m.get("author_id") == reporter_id:
             continue
         text = str(m.get("content") or "")
-        if not _CALLOUT_RE.search(text):
+        is_call = _is_mod_call(text)
+        if not is_call and not _CALLOUT_RE.search(text):
             continue
-        said = {"by": m.get("author_name"), "text": _clip(text, CALLOUT_TEXT_MAX)}
+        about = None
         ref = m.get("reply_to")
         if isinstance(ref, int) and ref in by_id and by_id[ref].get("author_id") != m.get("author_id"):
             about = by_id[ref]
-            entry = grouped.setdefault(
-                about["id"],
-                {
-                    "about_message_id": about["id"],
-                    "about_author": about.get("author_name"),
-                    "about_text": _gist(about),
-                    "said": [],
-                },
-            )
-            if len(entry["said"]) < 3:
-                entry["said"].append(said)
+        elif not is_call:
+            # Not a reply, so it could be about any of the last few messages,
+            # including an image with no words ("stop spamming it" after three
+            # screenshots). Say what was above it rather than pick one.
+            above = [
+                {"id": prev["id"], "author": prev.get("author_name"), "text": _gist(prev)}
+                for prev in reversed(ordered[:i])
+                if prev.get("author_id") != m.get("author_id") and not _is_mod_call(str(prev.get("content") or ""))
+            ][:CALLOUT_ABOVE]
+            if above:
+                grouped[("nr", m["id"])] = {
+                    "said": [{"by": m.get("author_name"), "text": _clip(text, CALLOUT_TEXT_MAX)}],
+                    "not_a_reply_so_about_one_of": above,
+                }
             continue
-        above = [
-            {"id": prev["id"], "author": prev.get("author_name"), "text": _gist(prev)}
-            for prev in reversed(ordered[:i])
-            if prev.get("author_id") != m.get("author_id")
-        ][:CALLOUT_ABOVE]
-        if not above:
+        else:
+            for prev in reversed(ordered[:i]):
+                prev_text = str(prev.get("content") or "")
+                # Another call ("modsss" right above "nuke this mf") is not
+                # the subject, and neither is the reporter asking for help.
+                if _is_mod_call(prev_text) or (is_call and prev.get("author_id") == reporter_id):
+                    continue
+                if prev.get("author_id") == m.get("author_id"):
+                    continue
+                # Link-only posts are usually reaction GIFs, so a suspicion
+                # callout skips them. A bare call for mods right after a
+                # link is about the link, though: a link on its own is the
+                # commonest spam there is.
+                if _has_words(prev) or (
+                    is_call and prev_text.strip() and not _GIF_RE.search(prev_text)
+                ):
+                    about = prev
+                    break
+        if about is None:
             continue
-        grouped[("nr", m["id"])] = {"said": [said], "not_a_reply_so_about_one_of": above}
+        entry = grouped.setdefault(
+            about["id"],
+            {
+                "about_message_id": about["id"],
+                "about_author": about.get("author_name"),
+                "about_text": _clip(str(about.get("content") or ""), CALLOUT_TEXT_MAX),
+                "said": [],
+            },
+        )
+        if len(entry["said"]) < 3:
+            entry["said"].append({"by": m.get("author_name"), "text": _clip(text, CALLOUT_TEXT_MAX)})
     return list(grouped.values())[-CALLOUT_MAX:]
 
 
@@ -283,8 +333,63 @@ def repeat_posts(messages: list[dict[str, Any]], reporter_id: Any) -> list[dict[
     return found[-REPEAT_MAX_LISTED:]
 
 
+def enforced_names(audit_findings: list[str] | None) -> set[str]:
+    """Who the audit lines say a moderator banned, kicked, timed out or
+    deleted messages from, by the name the line uses."""
+    names: set[str] = set()
+    for line in audit_findings or []:
+        match = _ENFORCEMENT_RE.match(str(line).lstrip("• ").strip())
+        if match:
+            names.add(match.group(1).strip().lower())
+    return names
+
+
+def _audit_pointer(
+    out: dict[str, Any],
+    messages: list[dict[str, Any]],
+    anchor_message_id: int,
+    audit_findings: list[str] | None,
+) -> dict[str, Any]:
+    """Point a bare ping at the person a moderator then acted on.
+
+    The guess for a bare ping is the last message before it, and on
+    2026-11-10 that was build talk while the referral link 24 seconds
+    earlier was what the ping was about. mod_b banned its author 33
+    seconds after the ping, the rebuild saw the ban, and the brief still
+    said "No action" because it was judging the wrong message. An
+    enforcement entry on someone who posted just before the ping outranks
+    proximity.
+    """
+    if out.get("replied_to_message_id") is not None:
+        return out
+    names = enforced_names(audit_findings)
+    if not names:
+        return out
+    reporter_id = out.get("user_id")
+    anchor_ms = snowflake_ms(anchor_message_id)
+    candidates = [
+        m
+        for m in messages
+        if isinstance(m.get("id"), int)
+        and m["id"] < anchor_message_id
+        and m.get("author_id") != reporter_id
+        and str(m.get("author_name") or "").strip().lower() in names
+        and anchor_ms - snowflake_ms(m["id"]) <= AUDIT_POINTER_WITHIN_MS
+    ]
+    if not candidates:
+        return out
+    target = max(candidates, key=lambda m: m["id"])
+    out["likely_reported_message_id"] = target["id"]
+    out["likely_reported_message"] = excerpt(target)
+    out["pointer_basis"] = "audit_findings shows a moderator acted on this author"
+    return out
+
+
 def reported_message_pointer(
-    reporter: dict[str, Any], messages: list[dict[str, Any]], anchor_message_id: int | None
+    reporter: dict[str, Any],
+    messages: list[dict[str, Any]],
+    anchor_message_id: int | None,
+    audit_findings: list[str] | None = None,
 ) -> dict[str, Any]:
     """The reporter dict, with what the ping points at and what was said about it.
 
@@ -294,9 +399,13 @@ def reported_message_pointer(
     "likely bot in chat" can move the model off the guess. Everything is
     recomputed, never carried over from a stored payload.
     """
-    out = _reported_pointer(reporter, messages, anchor_message_id)
+    out = _reported_pointer(
+        {k: v for k, v in reporter.items() if k != "pointer_basis"}, messages, anchor_message_id
+    )
     if anchor_message_id is None:
         return out
+    if out.get("bare_ping"):
+        out = _audit_pointer(out, messages, anchor_message_id, audit_findings)
     followup = reporter_followup_text(messages, out.get("user_id"), anchor_message_id)
     if followup:
         out["followup_text"] = followup
@@ -450,3 +559,28 @@ def analysis_image_candidates(
     for mid in neighbours:
         add(mid)
     return out
+
+
+def enforcement_conflict(raw_result: dict[str, Any], payload: dict[str, Any]) -> list[str]:
+    """Names a moderator acted on in this window when the analysis said
+    there was nothing to act on.
+
+    On 2026-11-10 a brief read "No action" directly above "Banned spam_user_d"
+    because it had judged the wrong message. The prompt already says audit
+    enforcement means Already handled; this is the check that it listened.
+    Empty when there is no conflict.
+    """
+    recs = [str(r).strip().lower().rstrip(".") for r in raw_result.get("recommendations") or []]
+    if recs != ["no action"]:
+        return []
+    names = enforced_names(payload.get("audit_findings"))
+    if not names:
+        return []
+    reporter_id = (payload.get("reporter") or {}).get("user_id")
+    authors = {
+        str(m.get("author_name") or "").strip().lower(): m.get("author_name")
+        for m in payload.get("messages") or []
+        if m.get("author_id") != reporter_id
+        and not (payload.get("authors") or {}).get(str(m.get("author_id")), {}).get("mod")
+    }
+    return sorted(str(authors[n]) for n in names if n in authors)

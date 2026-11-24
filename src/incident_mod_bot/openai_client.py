@@ -44,6 +44,9 @@ def _is_reasoning_model(model: str) -> bool:
     return model.startswith(_REASONING_MODEL_PREFIXES) and "chat" not in model
 
 
+_ANALYSIS_ATTEMPTS = 3
+
+
 def _sampling(model: str, *, temperature: float, max_output_tokens: int) -> dict[str, Any]:
     if _is_reasoning_model(model):
         return {
@@ -119,19 +122,33 @@ def _response_text(response: Any) -> str:
     return ""
 
 
+# Raw model replies that failed to parse, newest kept. They hold the Discord
+# messages the analysis was given, so they stay owner-readable and are capped.
+_DUMP_KEEP = 20
+
+
 def _dump_failure(text: str, purpose: str) -> str | None:
     base_dir = os.getenv("OPENAI_DEBUG_DUMP_DIR", "data/openai_debug")
     try:
-        Path(base_dir).mkdir(parents=True, exist_ok=True)
+        directory = Path(base_dir)
+        directory.mkdir(parents=True, exist_ok=True)
         filename = f"{purpose}_{int(time.time())}_{uuid4().hex[:8]}.txt"
-        path = Path(base_dir) / filename
+        path = directory / filename
         path.write_text(text, encoding="utf-8", errors="replace")
+        os.chmod(path, 0o600)
+        older = sorted(
+            (f for f in directory.glob("*.txt") if f != path),
+            key=lambda f: f.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for stale in older[_DUMP_KEEP - 1 :]:
+            stale.unlink(missing_ok=True)
         return str(path)
     except Exception:
         return None
 
 
-def _parse_json(text: str, purpose: str, *, debug_dump: bool) -> Any:
+def _parse_json(text: str, purpose: str) -> Any:
     if not text or not text.strip():
         raise ValueError(f"{purpose}: empty response text")
     try:
@@ -139,7 +156,10 @@ def _parse_json(text: str, purpose: str, *, debug_dump: bool) -> Any:
     except json.JSONDecodeError as exc:
         head = text[:200].replace("\n", "\\n")
         tail = text[-200:].replace("\n", "\\n")
-        dump_path = _dump_failure(text, purpose=purpose) if debug_dump else None
+        # Only the ends used to reach the log, which left a garbled reply
+        # impossible to look at afterwards. The whole thing is kept now, not
+        # only under DEBUG_LOGS.
+        dump_path = _dump_failure(text, purpose=purpose)
         extra = f" dump={dump_path}" if dump_path else ""
         raise ValueError(
             f"{purpose}: invalid JSON at line={exc.lineno} col={exc.colno} pos={exc.pos}"
@@ -163,7 +183,7 @@ def summarize_rules(client: OpenAI, settings: OpenAISettings, rules_text: str) -
     )
     _log_usage(settings, response, purpose="summarize_rules")
     text = _response_text(response)
-    data = _parse_json(text, purpose="summarize_rules", debug_dump=settings.debug_logs)
+    data = _parse_json(text, purpose="summarize_rules")
     if not isinstance(data, dict):
         raise ValueError("summarize_rules: expected a JSON object")
     return data
@@ -209,7 +229,7 @@ def summarize_images(
     )
     _log_usage(settings, response, purpose="summarize_images")
     text = _response_text(response)
-    data = _parse_json(text, purpose="summarize_images", debug_dump=settings.debug_logs)
+    data = _parse_json(text, purpose="summarize_images")
     if not isinstance(data, dict):
         raise ValueError("summarize_images: expected a JSON object")
     images = data.get("images")
@@ -259,6 +279,19 @@ def analyze_incident(
         "person, or proof of a scam can be the whole point of an otherwise short line. "
         "A message with attachments but no image_ids carried a file you were not shown; do "
         "not guess what it showed.\n"
+        "A message with deleted: true was removed (almost always by a moderator) before "
+        "this look; its text comes from the bot's cache and is what it said. Judge it like "
+        "any other message.\n"
+        "payload.consistency_check, when present, is a note about an earlier answer to this "
+        "same payload that contradicted audit_findings. Follow it.\n"
+        "payload.prior_read, when present, is this same incident's earlier analysis "
+        "(headline, summary, rules), made while images that can no longer be fetched were "
+        "still visible: a moderator banning an account usually deletes its messages, and "
+        "the attachments with them, within seconds. For the messages with attachments but "
+        "no image_ids, keep what prior_read established about what they showed - if it "
+        "called them explicit, a scam or a slur, say so in headline, summary and rule_refs "
+        "rather than writing 'the same image attachment'. Anything you can see now, or "
+        "audit_findings, outranks it.\n"
         "payload.authors maps author_id to facts about that account as of the anchor: "
         "account_age_days, joined_server_days (when known), mod (true for moderators), "
         "discord_spammer_flag (Discord itself has flagged the account as a likely spammer). "
@@ -292,6 +325,12 @@ def analyze_incident(
         "there, judge that message and its author on their own merits, and move off it only if "
         "the reporter's own words point elsewhere. When followup_text or callouts are present "
         "it is only a guess; see below.\n"
+        "  reporter.pointer_basis, when present, says the guess is not proximity: a moderator "
+        "banned, kicked, timed out or deleted messages from that message's author just around "
+        "the ping (audit_findings has the line). That is the strongest sign there is of what "
+        "a bare ping was about. Judge that message and its author, even when it is only a "
+        "link or sits a few messages above the ping, and never call the incident ordinary "
+        "chat because the message nearest the ping was.\n"
         "  reporter.followup_text, when present, is what the reporter wrote right after the "
         "ping, and it is part of the report. Words that only say what to do ('kill him', 'ban', "
         "'delete this', '^') point at the guess. Words that describe the subject - 'likely bot "
@@ -301,15 +340,29 @@ def analyze_incident(
         "is the closest.\n"
         "  reporter.callouts, when present, are other members voicing suspicion ('sussy', 'same "
         "prompt ahh bot', 'scam', 'stop spamming it'). A callout that was a reply names its "
-        "message (about_message_id). One that was not a reply lists the last few messages above "
-        "it (not_a_reply_so_about_one_of), and it may be about any of them, including an "
-        "[attachment] with no words, or about a run of messages; read the window and decide. "
-        "They are hints, not facts. When the reporter's words and the callouts line up on one message "
+        "message (about_message_id). A suspicion callout that was not a reply lists the last "
+        "few messages above it (not_a_reply_so_about_one_of), and it may be about any of them, "
+        "including an [attachment] with no words, or about a run of messages; read the window "
+        "and decide. They are hints, not facts. When the reporter's words and the callouts line up on one message "
         "and it reads like it (a generic 'Hello I'm new here, open to making friends, pls be "
         "friendly' with nothing else is a scripted bot greeting), that message is the reported "
         "one: judge it and name its author. Put a short clause in the summary saying what "
         "pointed you there, such as 'reporter flagged a likely bot; two members called it a "
         "scripted bot', so a mod can see why it was picked.\n"
+        "  Callouts also include bystanders calling for a moderator themselves ('mods', "
+        "'modssss', 'nuke this', 'ban him'). Two of those on one message before a bare ping "
+        "are as good as the reporter naming it.\n"
+        "payload.related_mod_actions, when present, lists bans, kicks and timeouts of people "
+        "the conversation mentions (by @) who did not post in it, with how long before or "
+        "after the ping each happened. They are about someone else: never treat them as "
+        "enforcement against anyone in the window, and never answer [\\\"Already handled.\\\"] "
+        "because of them. They matter when members tie a poster to that person ('people "
+        "think Ash is Birch who just got timed out', 'HES BACK!', 'same guy', 'new account'): "
+        "then the likely report is that the poster is the actioned person back on another "
+        "account to dodge it. Say so in the summary with the action and how long before the "
+        "ping it was, recommend checking whether the account is an alt evading that "
+        "action, and keep confidence moderate, since chat suspicion is not proof. A harmless "
+        "message from that poster does not make the report baseless.\n"
         "  reporter.repeat_posts, when present, lists members who posted the same attachment or "
         "the same text three or more times within seconds (same size and name means the same "
         "image reposted). Image-only messages have no words, so this is how you notice them. "
@@ -368,7 +421,14 @@ def analyze_incident(
         "this brief - do not restate what it already says (who was banned/kicked/timed "
         "out/had a message deleted) in headline or summary; say only what the underlying "
         "behavior was that led to it. 'Posted a scam link' is right; 'posted a scam link "
-        "and was banned for it' repeats what the moderator can already see one field down.\n\n"
+        "and was banned for it' repeats what the moderator can already see one field down.\n"
+        "  When an audit entry carries a reason in parentheses, that is the moderator's own "
+        "verdict on what the person did, and the summary must carry it: name the behavior "
+        "with that word ('Transphobic remark about another user'). A neutral retelling of "
+        "the words that leaves the violation unnamed ('implied that...', 'insinuated "
+        "that...', 'said that...') is wrong here, because the moderator has already "
+        "ruled on what it was. The reason names the behavior, so using it is not "
+        "restating the outcome.\n\n"
         "Return JSON only with keys: headline, summary, participants, signals, rule_refs, "
         "recommendations, draft_message, reply_targets, draft_replies, confidence, evidence_quotes, memory_suggestions, reporter_note.\n\n"
         "Hard limits (keep it tight):\n"
@@ -465,18 +525,33 @@ def analyze_incident(
             }
         )
     responses = getattr(client, "responses")
-    response = responses.create(
-        model=settings.model,
-        input=[{"role": "user", "content": content}],
-        text={"format": {"type": "json_object"}},
-        **_sampling(settings.model, temperature=0.0, max_output_tokens=900),
-    )
-    _log_usage(settings, response, purpose="analyze_incident")
-    text = _response_text(response)
-    data = _parse_json(text, purpose="analyze_incident", debug_dump=settings.debug_logs)
-    if not isinstance(data, dict):
-        raise ValueError("analyze_incident: expected a JSON object")
-    return data
+    # The model now and then degenerates part way through (a repeated hex string
+    # until the token cap cuts it off mid-value), which is invalid JSON. It does
+    # not repeat itself on a second try, and without one the whole brief - and
+    # any ping that was waiting on it - was simply never posted.
+    last_error: ValueError | None = None
+    for attempt in range(1, _ANALYSIS_ATTEMPTS + 1):
+        response = responses.create(
+            model=settings.model,
+            input=[{"role": "user", "content": content}],
+            text={"format": {"type": "json_object"}},
+            **_sampling(settings.model, temperature=0.0, max_output_tokens=900),
+        )
+        _log_usage(settings, response, purpose="analyze_incident")
+        text = _response_text(response)
+        try:
+            data = _parse_json(text, purpose="analyze_incident")
+            if not isinstance(data, dict):
+                raise ValueError("analyze_incident: expected a JSON object")
+            return data
+        except ValueError as exc:
+            last_error = exc
+            logger.warning(
+                "analyze_incident attempt %d of %d returned unusable output: %s",
+                attempt, _ANALYSIS_ATTEMPTS, str(exc)[:900],
+            )
+    assert last_error is not None
+    raise last_error
 
 
 def refine_incident_with_images(
@@ -570,7 +645,7 @@ def refine_incident_with_images(
     )
     _log_usage(settings, response, purpose="refine_incident_with_images")
     text = _response_text(response)
-    data = _parse_json(text, purpose="refine_incident_with_images", debug_dump=settings.debug_logs)
+    data = _parse_json(text, purpose="refine_incident_with_images")
     if not isinstance(data, dict):
         raise ValueError("refine_incident_with_images: expected a JSON object")
     return data
